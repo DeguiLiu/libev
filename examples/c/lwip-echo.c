@@ -13,7 +13,7 @@
  * One client connection = one ev_io watcher on its accepted fd. Non-blocking
  * accept is used because the listening fd is registered for EV_READ only.
  *
- * Build (Linux):  gcc examples/lwip-echo.c -I include -lev -o echo
+ * Build (Linux):  gcc examples/c/lwip-echo.c -I include -lev -o echo
  * Build (RT-Thread): compile with the libev sources, see configs/rt-thread.h
  */
 #include <stdio.h>

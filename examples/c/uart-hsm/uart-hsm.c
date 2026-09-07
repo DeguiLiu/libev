@@ -22,8 +22,8 @@
  * obtained through the RT-Thread device/DFS framework.
  *
  * Build:
- *   gcc examples/uart-hsm/uart-hsm.c examples/uart-hsm/hsm_parser.c \
- *       examples/uart-hsm/state_machine.c -I examples/uart-hsm \
+ *   gcc examples/c/uart-hsm/uart-hsm.c examples/c/uart-hsm/hsm_parser.c \
+ *       examples/c/uart-hsm/state_machine.c -I examples/c/uart-hsm \
  *       -I include -lev -o uart-hsm
  */
 #include <stdio.h>
