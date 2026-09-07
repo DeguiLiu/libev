@@ -1843,6 +1843,12 @@ ecb_binary32_to_binary16 (uint32_t x)
 
 #define NUMPRI (EV_MAXPRI - EV_MINPRI + 1)
 
+_Static_assert (NUMPRI > 0, "priority range must be non-empty");
+
+#if EV_MULTIPLICITY
+_Static_assert (sizeof (ev_tstamp) == sizeof (double), "ev_tstamp must be double-sized (EV_TSTAMP_T misconfigured)");
+#endif
+
 #if EV_MINPRI == EV_MAXPRI
 # define ABSPRI(w) (((W)w), 0)
 #else

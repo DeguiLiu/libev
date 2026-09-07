@@ -297,6 +297,8 @@ iouring_sqe_submit (EV_P_ struct io_uring_sqe *sqe)
   ++EV_SQ_VAR (tail);
   /*ECB_MEMORY_FENCE_RELEASE; /* for the time being we assume this is not needed */
   ++iouring_to_submit;
+
+  return sqe;
 }
 
 /*****************************************************************************/
@@ -328,6 +330,8 @@ iouring_internal_destroy (EV_P)
       ev_ref (EV_A);
       ev_io_stop (EV_A_ &iouring_tfd_w);
     }
+
+  return 0;
 }
 
 ecb_cold
