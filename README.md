@@ -60,6 +60,13 @@ sources from `src/unix/` and `src/win/` directly.
 "covered" = exercised through another example (same HSM engine or socket
 path).
 
+C++17 ports of the C examples live under `examples/cpp/` (CMake-built on
+Linux host): `lwip_echo`, `fs_hsm`, `hsm_echo`, `uart_hsm`, `uart_ring_hsm`
+mirror the five above, reusing the shared `hsm.hpp` (C++17 template HSM) and
+`ev_raii.hpp` (thin RAII watchers). `protocol_hsm`, `node_manager`,
+`async_proxy` are additional examples modeled after the coact framework.
+Shared headers: `hsm_parser.hpp`, `uart_protocol.hpp`, `spsc_ring.hpp`.
+
 ## Building
 
 ### Linux / macOS / BSD
@@ -79,12 +86,40 @@ Compile `src/ev.c` with `-DEV_CONFIG_H='"rt-thread.h"'` and `configs/` on
 the include path. See `configs/rt-thread.h` for the full feature set.
 Verified on RT-Thread 5.2.2 / STM32F407 in Renode 1.16.1.
 
-## Verification summary
+## Verification
 
-| Platform | Backend | Result |
-|---|---|---|
-| Linux x86 | epoll | 4/4 examples self-check pass |
-| RT-Thread STM32F407 (Renode) | select | uart-hsm PASS, fs-hsm PASS, lwip-echo PASS (loopback echo) |
+### Linux host (CMake + ctest)
+
+9/9 tests pass: `smoke` + 8 C++17 examples, each ending in a self-check.
+
+| Example | Check |
+|---|---|
+| `protocol_hsm` | final state `Disconnected`, counts match |
+| `node_manager` | 4 nodes `Connected`, heartbeat/miss counts match |
+| `async_proxy` | submitted == completed == 3 |
+| `lwip_echo` | loopback echo "hello lwip" |
+| `fs_hsm` | 4 MiB async write, 14 heartbeats during write |
+| `hsm_echo` | connection rx == tx |
+| `uart_hsm` | 4 frames parsed, 3 error classes rejected |
+| `uart_ring_hsm` | 2 frames via ring, 0 overflow |
+
+### RT-Thread STM32F407 (Renode)
+
+The C examples were verified on RT-Thread 5.2.2 / STM32F407 in Renode
+1.16.1 (select backend): `uart-hsm` PASS, `fs-hsm` PASS, `lwip-echo` PASS
+(loopback echo), `hsm-echo` covered by the HSM + socket paths of the others.
+
+## Pitfalls
+
+1. `ev_default_loop` is a global singleton; independent loops must use
+   `ev_loop_new` (sharing the default loop across threads trips a
+   "recursion during release" assertion).
+2. RT-Thread `errno` is a negative kernel error code (`-EAGAIN == -11`), so
+   non-blocking drain checks must compare `-EAGAIN == errno`.
+3. Anonymous `pipe()` needs `RT_USING_POSIX_PIPE` + `RT_USING_RESOURCE_ID`.
+4. lwIP static memory (~28 KB) does not fit the F407 128 KB SRAM alongside
+   product code; verify standalone.
+5. RAMFS has no fsync (flush is NULL); fs-hsm drops the SYNCING phase.
 
 ## Documentation
 

@@ -93,6 +93,13 @@ docs/       ev.3 / ev.pod（API 参考）、HLD / LLD 设计文档
 "已验证" = 在 RT-Thread STM32F407（Renode）上自检通过；
 "覆盖" = 通过其他示例覆盖（同一 HSM 引擎或同一 socket 通路）。
 
+C 示例的 C++17 重写版位于 `examples/cpp/`（CMake 构建，Linux host）：
+`lwip_echo`、`fs_hsm`、`hsm_echo`、`uart_hsm`、`uart_ring_hsm` 与上述五个
+一一对应，复用共享的 `hsm.hpp`（C++17 模板 HSM）与 `ev_raii.hpp`（薄
+RAII watcher）。`protocol_hsm`、`node_manager`、`async_proxy` 为参考 coact
+框架的额外示例。共享头：`hsm_parser.hpp`、`uart_protocol.hpp`、
+`spsc_ring.hpp`。
+
 ## 构建
 
 ### Linux / macOS / BSD
@@ -114,10 +121,37 @@ CMake 选项：`BUILD_SHARED_LIBS`、`BUILD_STATIC_LIBS`、`BUILD_TESTING`、
 
 ## 验证结论
 
-| 平台 | 后端 | 结果 |
-|---|---|---|
-| Linux x86 | epoll | 4/4 示例自检通过 |
-| RT-Thread STM32F407（Renode） | select | uart-hsm PASS、fs-hsm PASS、lwip-echo PASS（loopback 回显） |
+### Linux host（CMake + ctest）
+
+9/9 测试通过：`smoke` + 8 个 C++17 示例，每个以自检收尾。
+
+| 示例 | 自检 |
+|---|---|
+| `protocol_hsm` | 最终态 `Disconnected`，计数一致 |
+| `node_manager` | 4 节点 `Connected`，心跳/丢包计数一致 |
+| `async_proxy` | submitted == completed == 3 |
+| `lwip_echo` | loopback 回显 "hello lwip" |
+| `fs_hsm` | 4 MiB 异步写，写期间 14 次心跳 |
+| `hsm_echo` | 连接 rx == tx |
+| `uart_hsm` | 4 帧解析 + 3 类错误拒绝 |
+| `uart_ring_hsm` | 2 帧经环形缓冲，0 溢出 |
+
+### RT-Thread STM32F407（Renode）
+
+C 示例已在 RT-Thread 5.2.2 / STM32F407（Renode 1.16.1，select 后端）上
+验证：`uart-hsm` PASS、`fs-hsm` PASS、`lwip-echo` PASS（loopback 回显），
+`hsm-echo` 由前两者的 HSM + socket 通路覆盖。
+
+## 关键坑
+
+1. `ev_default_loop` 是全局单例；独立 loop 必须用 `ev_loop_new`（多线程
+   共享默认 loop 会触发 "recursion during release" 断言）。
+2. RT-Thread `errno` 是负内核错误码（`-EAGAIN == -11`），非阻塞 drain
+   判断须比较 `-EAGAIN == errno`。
+3. 匿名 `pipe()` 需要 `RT_USING_POSIX_PIPE` + `RT_USING_RESOURCE_ID`。
+4. lwIP 静态内存约 28 KB，与产品代码在 F407 128 KB SRAM 上不可共存，
+   须单独验证。
+5. RAMFS 无 fsync（flush 为 NULL），fs-hsm 须去掉 SYNCING 阶段。
 
 ## 文档
 
