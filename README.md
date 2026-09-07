@@ -37,7 +37,8 @@ src/        core: ev.c, event.c, ev_vars.h, ev_wrap.h
 src/unix/   unix backends: epoll, kqueue, poll, port, select, linuxaio, iouring
 src/win/    windows backend: ev_win32.c
 configs/    rt-thread.h (RT-Thread select-only config)
-examples/   runnable examples (Linux + RT-Thread)
+examples/c/    C examples (Linux + RT-Thread)
+examples/cpp/  C++17 examples (Linux host)
 test/       smoke tests
 docs/       ev.3 / ev.pod (API reference), HLD / LLD design docs
 ```

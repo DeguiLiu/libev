@@ -74,7 +74,8 @@ src/        核心：ev.c、event.c、ev_vars.h、ev_wrap.h
 src/unix/   unix 后端：epoll、kqueue、poll、port、select、linuxaio、iouring
 src/win/    windows 后端：ev_win32.c
 configs/    rt-thread.h（RT-Thread select-only 配置）
-examples/   4 个可运行示例（Linux + RT-Thread）
+examples/c/     C 示例（Linux + RT-Thread）
+examples/cpp/   C++17 示例（Linux host）
 test/       smoke 测试
 docs/       ev.3 / ev.pod（API 参考）、HLD / LLD 设计文档
 ```
