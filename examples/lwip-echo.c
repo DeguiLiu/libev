@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -136,7 +137,7 @@ accept_cb (EV_P_ ev_io *w, int revents)
       set_nonblock (cfd);
 
       {
-        int one = 1;
+        uint32_t one = 1;
         setsockopt (cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof (one));
       }
 
@@ -174,7 +175,7 @@ main (void)
 {
   struct ev_loop *loop = EV_DEFAULT;
   int lfd = socket (AF_INET, SOCK_STREAM, 0);
-  int one = 1;
+  uint32_t one = 1;
 
   if (lfd < 0)
     {

@@ -156,7 +156,7 @@ static void stop_timer_cb (EV_P_ ev_timer *w, int revents);
 static void
 test_timer_cb (EV_P_ ev_timer *w, int revents)
 {
-    static unsigned round_no;
+    static uint32_t round_no;
 
     (void) revents;
 
@@ -193,7 +193,7 @@ main (void)
 {
     struct ev_loop *loop = EV_DEFAULT;
     const hsm_parser_stats_t *stats;
-    int pass;
+    int32_t pass;
 
     /* the pipe plays the role of the UART fd; O_NONBLOCK on our read end */
     if (pipe (g_uart_pipe) < 0)

@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -59,7 +60,7 @@ typedef struct hsm_event hsm_event_t;
 typedef struct hsm_transition hsm_transition_t;
 
 struct hsm_event {
-    unsigned id;
+    uint32_t id;
     void *context;
 };
 
@@ -69,14 +70,14 @@ enum {
 };
 
 typedef void (*hsm_action_fn)(hsm_t *sm, const hsm_event_t *event);
-typedef int  (*hsm_guard_fn)(hsm_t *sm, const hsm_event_t *event); /* 1 pass */
+typedef int32_t (*hsm_guard_fn)(hsm_t *sm, const hsm_event_t *event); /* 1 pass */
 
 struct hsm_transition {
-    unsigned id;
+    uint32_t id;
     const hsm_state_t *target;     /* NULL for internal transitions */
     hsm_guard_fn guard;            /* NULL = always passes */
     hsm_action_fn action;          /* NULL = none */
-    int type;
+    int32_t type;
 };
 
 struct hsm_state {
@@ -84,7 +85,7 @@ struct hsm_state {
     hsm_action_fn entry_action;
     hsm_action_fn exit_action;
     const hsm_transition_t *transitions;
-    unsigned num_transitions;
+    uint32_t num_transitions;
     const char *name;
 };
 
@@ -95,9 +96,9 @@ struct hsm {
     void *user_data;
 };
 
-static unsigned hsm_depth_of (const hsm_state_t *s)
+static uint32_t hsm_depth_of (const hsm_state_t *s)
 {
-    unsigned d = 0;
+    uint32_t d = 0;
 
     while (s)
     {
@@ -111,8 +112,8 @@ static unsigned hsm_depth_of (const hsm_state_t *s)
 static const hsm_state_t *
 hsm_lca (const hsm_state_t *a, const hsm_state_t *b)
 {
-    unsigned da = hsm_depth_of (a);
-    unsigned db = hsm_depth_of (b);
+    uint32_t da = hsm_depth_of (a);
+    uint32_t db = hsm_depth_of (b);
 
     while (da > db) { a = a->parent; da--; }
     while (db > da) { b = b->parent; db--; }
@@ -157,7 +158,7 @@ hsm_perform_transition (hsm_t *sm, const hsm_state_t *target, const hsm_event_t 
 
     /* build entry path target..LCA (exclusive) */
     {
-        unsigned n = 0;
+        uint32_t n = 0;
         const hsm_state_t *it = target;
 
         while (it && it != lca)
@@ -180,14 +181,14 @@ hsm_perform_transition (hsm_t *sm, const hsm_state_t *target, const hsm_event_t 
 }
 
 /* dispatch: bubble up until some level's transition table handles it */
-static int
+static int32_t
 hsm_dispatch (hsm_t *sm, const hsm_event_t *e)
 {
     const hsm_state_t *s = sm->current;
 
     while (s)
     {
-        unsigned i;
+        uint32_t i;
 
         for (i = 0; i < s->num_transitions; i++)
         {
@@ -224,7 +225,7 @@ hsm_init (hsm_t *sm, const hsm_state_t *initial, void *user_data)
     hsm_perform_transition (sm, initial, NULL);
 }
 
-static int
+static int32_t
 hsm_is_in (const hsm_t *sm, const hsm_state_t *state)
 {
     const hsm_state_t *it = sm->current;
@@ -259,7 +260,7 @@ struct conn {
     char queue[QUEUE_CAP];
     size_t q_len;
     char buf[BUF_SIZE];
-    unsigned long rx, tx;
+    uint64_t rx, tx;
     struct conn *next, **pp_self;
 };
 
@@ -588,7 +589,7 @@ accept_cb (EV_P_ ev_io *w, int revents)
         set_nonblock (cfd);
 
         {
-            int one = 1;
+            uint32_t one = 1;
             setsockopt (cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof (one));
         }
 
@@ -636,7 +637,7 @@ main (void)
 {
     struct ev_loop *lp = EV_DEFAULT;
     int lfd = socket (AF_INET, SOCK_STREAM, 0);
-    int one = 1;
+    uint32_t one = 1;
 
     loop = lp;
 
