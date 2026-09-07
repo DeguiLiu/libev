@@ -17,6 +17,24 @@ option(SKIP_INSTALL_HEADERS "Do not install header files" OFF)
 
 set(EV_SANITIZER "" CACHE STRING "Sanitizer to enable: address, thread, undefined, or empty")
 
+option(EV_WERROR "Treat dangerous compiler warnings as errors" ON)
+
+if(EV_WERROR)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        add_compile_options(-Wall -Wextra)
+        # libev deliberately uses cross-platform idioms (macro comma-expressions,
+        # nested-comment marks, EV_NOEXCEPT noreturn decls) that trip style-class
+        # warnings. Error only on warnings that indicate real defects.
+        add_compile_options(
+            -Werror=implicit-function-declaration
+            -Werror=int-conversion
+            -Werror=incompatible-pointer-types
+            -Werror=return-type
+            -Werror=format
+        )
+    endif()
+endif()
+
 if(EV_SANITIZER)
     if(NOT EV_SANITIZER MATCHES "^(address|thread|undefined)$")
         message(FATAL_ERROR "EV_SANITIZER must be address, thread, undefined, or empty")
