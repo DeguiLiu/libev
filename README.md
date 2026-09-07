@@ -1,100 +1,101 @@
-# libev
+# libev 4.33 — RT-Thread port
 
-libev is a high-performance event loop/event model with lots of features.
-(see benchmark at http://libev.schmorp.de/bench.html)
+[English](README.md) · [简体中文](README_zh.md)
 
-## About
+A fork of [libev](http://software.schmorp.de/pkg/libev) 4.33 that adds an
+RT-Thread MCU port and verifies the event loop on embedded targets, while
+keeping the original Linux/BSD/Windows support intact.
 
-Homepage: http://software.schmorp.de/pkg/libev
+libev is a high-performance, full-featured event loop implementing the
+Reactor pattern. It unifies OS I/O multiplexing mechanisms behind one API
+and covers I/O, timer, signal, child-process, and filesystem events.
 
-Mailinglist: libev@lists.schmorp.de
-http://lists.schmorp.de/cgi-bin/mailman/listinfo/libev
+This fork adds on top of upstream 4.33:
 
-Library Documentation: http://pod.tst.eu/http://cvs.schmorp.de/libev/ev.pod
+- `configs/rt-thread.h` — a select-only backend config for RT-Thread: the
+  RT-Thread POSIX layer provides `select`, every other backend and the
+  Linux-specific kernel features are compiled out.
+- Four runnable examples, each verified on an STM32F407 in Renode
+  full-system simulation.
+- Architecture design documents (HLD / LLD) under `docs/`.
 
-Libev is modelled (very losely) after libevent and the Event perl
-module, but is faster, scales better and is more correct, and also more
-featureful. And also smaller. Yay.
+## Backends
 
-Some of the specialties of libev not commonly found elsewhere are:
+| Platform | Backend |
+|---|---|
+| Linux | epoll (default), select, poll, linuxaio, iouring |
+| BSD / macOS | kqueue |
+| Solaris | port |
+| Windows | select |
+| RT-Thread MCU | select (via `configs/rt-thread.h`) |
 
-- extensive and detailed, readable documentation (not doxygen garbage).
-- fully supports fork, can detect fork in various ways and automatically
-  re-arms kernel mechanisms that do not support fork.
-- highly optimised select, poll, linux epoll, linux aio, bsd kqueue
-  and solaris event ports backends.
-- filesystem object (path) watching (with optional linux inotify support).
-- wallclock-based times (using absolute time, cron-like).
-- relative timers/timeouts (handle time jumps).
-- fast intra-thread communication between multiple
-  event loops (with optional fast linux eventfd backend).
-- extremely easy to embed (fully documented, no dependencies,
-  configuration supported but optional).
-- very small codebase, no bloated library, simple code.
-- fully extensible by being able to plug into the event loop,
-  integrate other event loops, integrate other event loop users.
-- very little memory use (small watchers, small event loop data).
-- optional C++ interface allowing method and function callbacks
-  at no extra memory or runtime overhead.
-- optional Perl interface with similar characteristics (capable of
-  running Glib/Gtk2 on libev).
-- support for other languages (multiple C++ interfaces, D, Ruby,
-  Python) available from third-parties.
-
-Examples of programs that embed libev: the EV perl module, node.js,
-auditd, rxvt-unicode, gvpe (GNU Virtual Private Ethernet), the
-Deliantra MMORPG server (http://www.deliantra.net/), Rubinius (a
-next-generation Ruby VM), the Ebb web server, the Rev event toolkit.
-
-## Building with CMake
+## Repository layout
 
 ```
+include/    public headers: ev.h, ev++.h, event.h
+src/        core: ev.c, event.c, ev_vars.h, ev_wrap.h
+src/unix/   unix backends: epoll, kqueue, poll, port, select, linuxaio, iouring
+src/win/    windows backend: ev_win32.c
+configs/    rt-thread.h (RT-Thread select-only config)
+examples/   runnable examples (Linux + RT-Thread)
+test/       smoke tests
+docs/       ev.3 / ev.pod (API reference), HLD / LLD design docs
+```
+
+`ev.c` compiles as a single translation unit: it `#include`s the backend
+sources from `src/unix/` and `src/win/` directly.
+
+## Examples
+
+| Example | Watchers | What it demonstrates | RT-Thread |
+|---|---|---|---|
+| `uart-hsm` | ev_io + ev_timer | UART protocol parsing driven by an HSM parser | verified |
+| `uart-ring-hsm` | ev_async + spsc ring | ISR -> ring -> libev -> HSM (MCU-realistic) | covered |
+| `fs-hsm` | ev_async + worker | async file write; heartbeat proves the loop stays live | verified |
+| `lwip-echo` | ev_io | TCP echo server over LwIP via the SAL socket layer | verified |
+| `hsm-echo` | ev_io | HSM connection lifecycle + socket | covered |
+
+"verified" = self-check passed on RT-Thread STM32F407 in Renode;
+"covered" = exercised through another example (same HSM engine or socket
+path).
+
+## Building
+
+### Linux / macOS / BSD
+
+```sh
 cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Options:
+CMake options: `BUILD_SHARED_LIBS`, `BUILD_STATIC_LIBS`, `BUILD_TESTING`,
+`EV_SANITIZER` (`address`/`thread`/`undefined`), `EV_WERROR`.
 
-- `BUILD_SHARED_LIBS` (default `ON`): build `libev.so`
-- `BUILD_STATIC_LIBS` (default `ON`): build `libev.a`
-- `BUILD_TESTING` (default `ON`): build and register the smoke test
+### RT-Thread MCU
 
-Install:
+Compile `src/ev.c` with `-DEV_CONFIG_H='"rt-thread.h"'` and `configs/` on
+the include path. See `configs/rt-thread.h` for the full feature set.
+Verified on RT-Thread 5.2.2 / STM32F407 in Renode 1.16.1.
 
-```
-cmake --install build --prefix /usr/local
-```
+## Verification summary
 
-This installs `ev.h`, `ev++.h`, `event.h` into `include/`, the
-libraries into `lib/`, `libev.pc` into `lib/pkgconfig/`, and the man
-page into `share/man/man3/`.
+| Platform | Backend | Result |
+|---|---|---|
+| Linux x86 | epoll | 4/4 examples self-check pass |
+| RT-Thread STM32F407 (Renode) | select | uart-hsm PASS, fs-hsm PASS, lwip-echo PASS (loopback echo) |
 
-## Repository layout
+## Documentation
 
-```
-include/   public headers: ev.h, ev++.h, event.h
-src/       core sources: ev.c, event.c, ev_vars.h, ev_wrap.h
-src/unix/  unix backends: epoll, kqueue, poll, port, select, linuxaio, iouring
-src/win/   windows backend: ev_win32.c
-test/      smoke tests
-docs/      documentation: ev.3 (man page), ev.pod (source)
-Symbols.ev, Symbols.event   exported symbol lists (ABI reference)
-```
+- [docs/libev-HLD-Design.md](docs/libev-HLD-Design.md) — architecture overview
+- [docs/libev-LLD-Design.md](docs/libev-LLD-Design.md) — detailed design
+- [docs/ev.3](docs/ev.3) — API reference (man page)
 
-`ev.c` compiles as a single translation unit: it `#include`s the
-backend sources from `src/unix/` and `src/win/` directly, which is why
-those files are not compiled separately.
+## License
 
-## Contributors
+BSD 2-clause, also available under GPLv2+. See [LICENSE](LICENSE).
 
-libev was written and designed by Marc Lehmann and Emanuele Giaquinta.
+## Upstream
 
-The following people sent in patches or made other noteworthy
-contributions to the design (for minor patches, see the Changes
-file. If I forgot to include you, please shout at me, it was an
-accident):
-
-W.C.A. Wijngaards
-Christopher Layne
-Chris Brody
+Based on [libev 4.33](http://software.schmorp.de/pkg/libev) by Marc Lehmann
+and Emanuele Giaquinta.
