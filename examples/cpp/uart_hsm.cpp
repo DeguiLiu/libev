@@ -7,6 +7,7 @@
 // garbage frames, and a self-check asserts the parser survives them.
 // SPDX-License-Identifier: MIT
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 
@@ -21,13 +22,6 @@ namespace {
 
 constexpr int kRd = 0;
 constexpr int kWr = 1;
-
-uart::HsmParser g_parser;
-evx::Loop* g_loop = nullptr;
-int g_pipe[2] = {-1, -1};
-uint32_t g_frames_rx = 0U;
-uint32_t g_frames_sent = 0U;
-uint32_t g_round = 0U;
 
 struct TestCase {
     const char* name;
@@ -44,26 +38,56 @@ const TestCase kTests[] = {
     { "ota start", uart::kClassOta, uart::kOtaStart, { 0, 0, 0, 16, 0, 0, 0, 0 }, 8U },
 };
 
-void frame_cb(const uart::Frame& frame, void*)
+class UartHsmDemo {
+public:
+    UartHsmDemo() noexcept
+        : uart_(loop_, this), test_(loop_, this), stop_(loop_, this)
+    {
+    }
+
+    int run() noexcept;
+
+private:
+    static void frame_cb(const uart::Frame& frame, void* user_data) noexcept;
+    void uart_rx_cb(ev_io& w, int revents) noexcept;
+    void test_timer_cb(ev_timer& w, int revents) noexcept;
+    void stop_cb(ev_timer& w, int revents) noexcept;
+    void send_frame(const TestCase& t) noexcept;
+    void send_garbage() noexcept;
+
+    uart::HsmParser parser_;
+    evx::Loop loop_;
+    std::array<int, 2> pipe_ = {-1, -1};
+    uint32_t frames_rx_ = 0U;
+    uint32_t frames_sent_ = 0U;
+    uint32_t round_ = 0U;
+    evx::Io<UartHsmDemo, &UartHsmDemo::uart_rx_cb> uart_;
+    evx::Timer<UartHsmDemo, &UartHsmDemo::test_timer_cb> test_;
+    evx::Timer<UartHsmDemo, &UartHsmDemo::stop_cb> stop_;
+};
+
+void UartHsmDemo::frame_cb(const uart::Frame& frame, void* user_data) noexcept
 {
+    UartHsmDemo* self = static_cast<UartHsmDemo*>(user_data);
+
     std::printf("[HSM] frame: class=0x%02X cmd=0x%02X data_len=%u\n",
                 static_cast<unsigned>(frame.cmd_class),
                 static_cast<unsigned>(frame.cmd),
                 static_cast<unsigned>(frame.data_len));
-    ++g_frames_rx;
+    ++self->frames_rx_;
 }
 
-void uart_rx_cb(ev_io* w, int)
+void UartHsmDemo::uart_rx_cb(ev_io& w, int) noexcept
 {
     uint8_t buf[128];
 
     for (;;)
     {
-        const ssize_t n = read(w->fd, buf, sizeof(buf));
+        const ssize_t n = read(w.fd, buf, sizeof(buf));
 
         if (n > 0)
         {
-            g_parser.put_data(buf, static_cast<uint32_t>(n));
+            parser_.put_data(buf, static_cast<uint32_t>(n));
         }
         else if (n < 0 && EAGAIN == errno)
         {
@@ -75,23 +99,23 @@ void uart_rx_cb(ev_io* w, int)
         }
         else
         {
-            ev_io_stop(g_loop->raw(), w);
+            ev_io_stop(loop_.raw(), &w);
             break;
         }
     }
 }
 
-void send_frame(const TestCase& t)
+void UartHsmDemo::send_frame(const TestCase& t) noexcept
 {
     uint8_t buf[64];
     const uint32_t len = uart::build_frame(buf, t.cmd_class, t.cmd, t.data, t.data_len);
 
     std::printf("[TEST] %-14s -> %u bytes\n", t.name, static_cast<unsigned>(len));
-    static_cast<void>(write(g_pipe[kWr], buf, len));
-    ++g_frames_sent;
+    static_cast<void>(write(pipe_[kWr], buf, len));
+    ++frames_sent_;
 }
 
-void send_garbage()
+void UartHsmDemo::send_garbage() noexcept
 {
     static const uint8_t bad1[] = { 0xBB, 0xCC };
     uint8_t bad2[8] = { 0xAA, 0x02, 0x00, 0x01, 0x01, 0xFF, 0xFF, 0x55 };
@@ -102,81 +126,60 @@ void send_garbage()
     bad3[6] = static_cast<uint8_t>((crc >> 8) & 0xFFU);
 
     std::printf("[TEST] garbage frames (bad hdr / bad crc / bad tail)\n");
-    static_cast<void>(write(g_pipe[kWr], bad1, sizeof(bad1)));
-    static_cast<void>(write(g_pipe[kWr], bad2, sizeof(bad2)));
-    static_cast<void>(write(g_pipe[kWr], bad3, sizeof(bad3)));
+    static_cast<void>(write(pipe_[kWr], bad1, sizeof(bad1)));
+    static_cast<void>(write(pipe_[kWr], bad2, sizeof(bad2)));
+    static_cast<void>(write(pipe_[kWr], bad3, sizeof(bad3)));
 }
 
-void stop_cb(ev_timer*, int)
+void UartHsmDemo::test_timer_cb(ev_timer& w, int) noexcept
 {
-    g_loop->break_loop();
-}
-
-evx::Timer<stop_cb>* g_stop = nullptr;
-
-void test_timer_cb(ev_timer* w, int)
-{
-    if (g_round < 4U)
+    if (round_ < 4U)
     {
-        send_frame(kTests[g_round]);
+        send_frame(kTests[round_]);
     }
-    else if (4U == g_round)
+    else if (4U == round_)
     {
         send_garbage();
     }
 
-    ++g_round;
+    ++round_;
 
-    if (g_round > 5U)
+    if (round_ > 5U)
     {
-        ev_timer_stop(g_loop->raw(), w);
-        if (nullptr != g_stop)
-        {
-            g_stop->start(0.3, 0.0);
-        }
+        ev_timer_stop(loop_.raw(), &w);
+        stop_.start(0.3, 0.0);
     }
 }
 
-}  // namespace
-
-int main()
+void UartHsmDemo::stop_cb(ev_timer&, int) noexcept
 {
-    if (pipe(g_pipe) < 0)
+    loop_.break_loop();
+}
+
+int UartHsmDemo::run() noexcept
+{
+    if (pipe(pipe_.data()) < 0)
     {
         std::printf("pipe failed\n");
         return 1;
     }
     {
-        const int flags = fcntl(g_pipe[kRd], F_GETFL, 0);
-        static_cast<void>(fcntl(g_pipe[kRd], F_SETFL, flags | O_NONBLOCK));
+        const int flags = fcntl(pipe_[kRd], F_GETFL, 0);
+        static_cast<void>(fcntl(pipe_[kRd], F_SETFL, flags | O_NONBLOCK));
     }
 
-    evx::Loop loop;
-    if (!loop.valid())
-    {
-        std::printf("ev_loop_new failed\n");
-        return 1;
-    }
-    g_loop = &loop;
+    parser_.init(frame_cb, this);
 
-    g_parser.init(frame_cb, nullptr);
-
-    evx::Io<uart_rx_cb> uart_w(loop);
-    uart_w.start(g_pipe[kRd], EV_READ);
-
-    evx::Timer<test_timer_cb> test_w(loop);
-    test_w.start(0.05, 0.1);
-
-    evx::Timer<stop_cb> stop(loop);
-    g_stop = &stop;
+    uart_.start(pipe_[kRd], EV_READ);
+    test_.start(0.05, 0.1);
 
     std::printf("=== libev C++17 uart-hsm demo ===\n");
-    loop.run(0);
+    loop_.run(0);
 
-    const uart::Stats& stats = g_parser.stats();
+    const uart::Stats& stats = parser_.stats();
 
     std::printf("\n--- results ---\n");
-    std::printf("frames sent (good)      : %u\n", static_cast<unsigned>(g_frames_sent));
+    std::printf("frames sent (good)      : %u\n", static_cast<unsigned>(frames_sent_));
     std::printf("frames parsed           : %u\n", static_cast<unsigned>(stats.frames_received));
     std::printf("bytes received          : %u\n", static_cast<unsigned>(stats.bytes_received));
     std::printf("sync/crc/tail errors    : %u / %u / %u\n",
@@ -185,15 +188,23 @@ int main()
                 static_cast<unsigned>(stats.tail_errors));
 
     const bool pass =
-        (g_frames_rx == g_frames_sent) &&
+        (frames_rx_ == frames_sent_) &&
         (stats.crc_errors >= 1U) &&
         (stats.tail_errors >= 1U) &&
         (stats.sync_errors >= 1U);
 
     std::printf("UART_HSM_CHECK: %s\n", pass ? "PASS" : "FAIL");
 
-    close(g_pipe[kRd]);
-    close(g_pipe[kWr]);
+    close(pipe_[kRd]);
+    close(pipe_[kWr]);
 
     return pass ? 0 : 1;
+}
+
+}  // namespace
+
+int main()
+{
+    UartHsmDemo demo;
+    return demo.run();
 }

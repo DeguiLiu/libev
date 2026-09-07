@@ -3,9 +3,11 @@
 // Mirrors examples/c/lwip-echo.c in C++: one ev_io on the listening fd
 // (accept), one ev_io per accepted connection (echo). Connections live in a
 // fixed-capacity pool (zero heap), unlike the C version's calloc/free. A
-// detached loopback client self-checks the echo path end-to-end.
+// detached loopback client self-checks the echo path end-to-end. State and
+// callbacks are members of EchoServer; the pool is indexed, not pointer-chased.
 // SPDX-License-Identifier: MIT
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -26,50 +28,84 @@ namespace {
 constexpr int kListenPort = 7700;
 constexpr uint16_t kBufSize = 1024U;
 constexpr uint16_t kMaxConns = 16U;
+constexpr uint16_t kNoConn = kMaxConns;   // alloc sentinel
 
-struct Conn {
-    ev_io io;
-    bool used;
-    char buf[kBufSize];
+class EchoServer {
+public:
+    EchoServer() noexcept : listen_(loop_, this), timeout_(loop_, this) {}
+
+    int run() noexcept;
+
+private:
+    struct Conn {
+        ev_io io;
+        bool used = false;
+        char buf[kBufSize];
+    };
+
+    static void set_nonblock(int fd) noexcept;
+    static void conn_thunk(struct ev_loop* loop, ev_io* w, int revents) noexcept;
+    static void* client_main(void* arg) noexcept;
+
+    void accept_cb(ev_io& w, int revents) noexcept;
+    void timeout_cb(ev_timer& w, int revents) noexcept;
+    void handle_conn(Conn& c, ev_io& w, int revents) noexcept;
+
+    uint16_t alloc_conn() noexcept;
+    void free_conn(Conn& c) noexcept;
+
+    evx::Loop loop_;
+    std::array<Conn, kMaxConns> conns_;
+    evx::Io<EchoServer, &EchoServer::accept_cb> listen_;
+    evx::Timer<EchoServer, &EchoServer::timeout_cb> timeout_;
+    bool client_pass_ = false;
 };
 
-Conn g_conns[kMaxConns];
-evx::Loop* g_loop = nullptr;
-bool g_client_pass = false;
-
-void set_nonblock(int fd)
+void EchoServer::set_nonblock(int fd) noexcept
 {
     const int flags = fcntl(fd, F_GETFL, 0);
     static_cast<void>(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
 }
 
-Conn* alloc_conn()
+uint16_t EchoServer::alloc_conn() noexcept
 {
     for (uint16_t i = 0U; i < kMaxConns; ++i)
     {
-        if (!g_conns[i].used)
+        if (!conns_[i].used)
         {
-            g_conns[i].used = true;
-            return &g_conns[i];
+            conns_[i].used = true;
+            return i;
         }
     }
-    return nullptr;
+    return kNoConn;
 }
 
-void free_conn(Conn* c)
+void EchoServer::free_conn(Conn& c) noexcept
 {
-    ev_io_stop(g_loop->raw(), &c->io);
-    close(c->io.fd);
-    c->used = false;
+    ev_io_stop(loop_.raw(), &c.io);
+    close(c.io.fd);
+    c.used = false;
 }
 
-void conn_cb(struct ev_loop*, ev_io* w, int revents)
+void EchoServer::conn_thunk(struct ev_loop*, ev_io* w, int revents) noexcept
 {
-    Conn* c = static_cast<Conn*>(w->data);
+    EchoServer* self = static_cast<EchoServer*>(w->data);
 
+    for (Conn& c : self->conns_)
+    {
+        if (&c.io == w)
+        {
+            self->handle_conn(c, *w, revents);
+            return;
+        }
+    }
+}
+
+void EchoServer::handle_conn(Conn& c, ev_io& w, int revents) noexcept
+{
     if (revents & EV_READ)
     {
-        const ssize_t n = recv(w->fd, c->buf, kBufSize, 0);
+        const ssize_t n = recv(w.fd, c.buf, kBufSize, 0);
 
         if (n <= 0)
         {
@@ -85,7 +121,7 @@ void conn_cb(struct ev_loop*, ev_io* w, int revents)
 
             while (off < n)
             {
-                const ssize_t m = send(w->fd, c->buf + off, static_cast<size_t>(n - off), 0);
+                const ssize_t m = send(w.fd, c.buf + off, static_cast<size_t>(n - off), 0);
 
                 if (m < 0)
                 {
@@ -102,13 +138,13 @@ void conn_cb(struct ev_loop*, ev_io* w, int revents)
     }
 }
 
-void accept_cb(ev_io* w, int revents)
+void EchoServer::accept_cb(ev_io& w, int revents) noexcept
 {
     (void)revents;
 
     for (;;)
     {
-        const int cfd = accept(w->fd, nullptr, nullptr);
+        const int cfd = accept(w.fd, nullptr, nullptr);
 
         if (cfd < 0)
         {
@@ -123,23 +159,30 @@ void accept_cb(ev_io* w, int revents)
             static_cast<void>(setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)));
         }
 
-        Conn* c = alloc_conn();
-        if (nullptr == c)
+        const uint16_t idx = alloc_conn();
+        if (kNoConn == idx)
         {
             close(cfd);
             continue;
         }
 
-        ev_io_init(&c->io, conn_cb, cfd, EV_READ);
-        c->io.data = c;
-        ev_io_start(g_loop->raw(), &c->io);
+        Conn& c = conns_[idx];
+        ev_io_init(&c.io, conn_thunk, cfd, EV_READ);
+        c.io.data = this;
+        ev_io_start(loop_.raw(), &c.io);
 
         std::printf("[lwip-echo] accepted fd=%d\n", cfd);
     }
 }
 
-void* client_main(void*)
+void EchoServer::timeout_cb(ev_timer&, int) noexcept
 {
+    loop_.break_loop();
+}
+
+void* EchoServer::client_main(void* arg) noexcept
+{
+    EchoServer* self = static_cast<EchoServer*>(arg);
     const char msg[] = "hello lwip";
     char buf[64] = {0};
 
@@ -166,30 +209,15 @@ void* client_main(void*)
     static_cast<void>(send(cfd, msg, sizeof(msg) - 1U, 0));
     const ssize_t n = recv(cfd, buf, sizeof(buf) - 1U, 0);
 
-    g_client_pass = (n > 0) && (0 == std::strcmp(buf, msg));
+    self->client_pass_ = (n > 0) && (0 == std::strcmp(buf, msg));
     std::printf("[lwip-echo] client got \"%s\"\n", buf);
 
     close(cfd);
     return nullptr;
 }
 
-void timeout_cb(ev_timer*, int)
+int EchoServer::run() noexcept
 {
-    g_loop->break_loop();
-}
-
-}  // namespace
-
-int main()
-{
-    evx::Loop loop;
-    if (!loop.valid())
-    {
-        std::printf("ev_loop_new failed\n");
-        return 1;
-    }
-    g_loop = &loop;
-
     const int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0)
     {
@@ -221,26 +249,31 @@ int main()
     }
     set_nonblock(lfd);
 
-    evx::Io<accept_cb> listen_w(loop);
-    listen_w.start(lfd, EV_READ);
-
-    evx::Timer<timeout_cb> timeout(loop);
-    timeout.start(2.0, 0.0);
+    listen_.start(lfd, EV_READ);
+    timeout_.start(2.0, 0.0);
 
     pthread_t client;
-    static_cast<void>(pthread_create(&client, nullptr, client_main, nullptr));
+    static_cast<void>(pthread_create(&client, nullptr, client_main, this));
 
     std::printf("=== libev C++17 lwip-echo demo ===\n");
     std::printf("[lwip-echo] echo server on port %d, backend 0x%x\n",
-                kListenPort, loop.backend());
+                kListenPort, loop_.backend());
 
-    loop.run(0);
+    loop_.run(0);
 
     static_cast<void>(pthread_join(client, nullptr));
 
-    const bool pass = g_client_pass;
+    const bool pass = client_pass_;
     std::printf("LWIP_ECHO_CHECK: %s\n", pass ? "PASS" : "FAIL");
 
     close(lfd);
     return pass ? 0 : 1;
+}
+
+}  // namespace
+
+int main()
+{
+    EchoServer server;
+    return server.run();
 }

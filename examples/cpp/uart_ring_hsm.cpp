@@ -30,22 +30,44 @@ struct TestCase {
     uint8_t cmd;
 };
 
-void wake_cb(ev_async*, int);
-void drain_cb(ev_timer*, int);
-void frame_cb(const uart::Frame&, void*);
+class UartRingHsmDemo {
+public:
+    UartRingHsmDemo() noexcept : wake_(loop_, this), drain_(loop_, this) {}
 
-uart::HsmParser g_parser;
-spsc::Ring<kRingSize> g_ring;
-evx::Loop* g_loop = nullptr;
-evx::Async<wake_cb>* g_wake = nullptr;
+    int run() noexcept;
 
-uint32_t g_frames_rx = 0U;
-uint32_t g_dropped = 0U;                 /* ring-full overflow count */
-std::atomic<bool> g_running{true};
+private:
+    static void frame_cb(const uart::Frame& frame, void* user_data) noexcept;
+    static void* isr_main(void* arg) noexcept;
 
-/* producer: simulate the UART ISR running on another thread/vector */
-void* isr_main(void*)
+    void wake_cb(ev_async& w, int revents) noexcept;
+    void drain_cb(ev_timer& w, int revents) noexcept;
+    void drain_ring() noexcept;
+
+    uart::HsmParser parser_;
+    spsc::Ring<kRingSize> ring_;
+    evx::Loop loop_;
+    evx::Async<UartRingHsmDemo, &UartRingHsmDemo::wake_cb> wake_;
+    evx::Timer<UartRingHsmDemo, &UartRingHsmDemo::drain_cb> drain_;
+    uint32_t frames_rx_ = 0U;
+    uint32_t dropped_ = 0U;              /* ring-full overflow count */
+    std::atomic<bool> running_{true};
+};
+
+void UartRingHsmDemo::frame_cb(const uart::Frame& frame, void* user_data) noexcept
 {
+    UartRingHsmDemo* self = static_cast<UartRingHsmDemo*>(user_data);
+
+    std::printf("[HSM] frame: class=0x%02X cmd=0x%02X data_len=%u\n",
+                static_cast<unsigned>(frame.cmd_class),
+                static_cast<unsigned>(frame.cmd),
+                static_cast<unsigned>(frame.data_len));
+    ++self->frames_rx_;
+}
+
+void* UartRingHsmDemo::isr_main(void* arg) noexcept
+{
+    UartRingHsmDemo* self = static_cast<UartRingHsmDemo*>(arg);
     const TestCase tests[] = {
         { "sys", uart::kClassSys, uart::kSysGetInfo },
         { "spi", uart::kClassSpi, uart::kSpiRead },
@@ -64,104 +86,87 @@ void* isr_main(void*)
         {
             const uint32_t n = (len - off > kPokeCount) ? kPokeCount : (len - off);
 
-            if (!g_ring.push(&frame[off], n))
+            if (!self->ring_.push(&frame[off], n))
             {
-                g_dropped += n;
+                self->dropped_ += n;
             }
 
             off += n;
-            g_wake->send();     /* wake the loop */
-            usleep(1000);       /* next interrupt arrives later */
+            self->wake_.send();     /* wake the loop */
+            usleep(1000);           /* next interrupt arrives later */
         }
     }
 
-    g_running.store(false);
-    g_wake->send();
+    self->running_.store(false);
+    self->wake_.send();
     return nullptr;
 }
 
-/* consumer: loop side -- drain the ring straight into the HSM */
-void drain_ring()
+void UartRingHsmDemo::drain_ring() noexcept
 {
     uint8_t buf[64];
     uint32_t got;
 
-    while (0U != (got = g_ring.pop(buf, sizeof(buf))))
+    while (0U != (got = ring_.pop(buf, sizeof(buf))))
     {
-        g_parser.put_data(buf, got);
+        parser_.put_data(buf, got);
     }
 }
 
-void wake_cb(ev_async*, int)
+void UartRingHsmDemo::wake_cb(ev_async&, int) noexcept
 {
     drain_ring();
 
-    if (!g_running.load() && (0U == g_ring.data_len()))
+    if (!running_.load() && (0U == ring_.data_len()))
     {
-        g_loop->break_loop();
+        loop_.break_loop();
     }
 }
 
-/* periodic drain: belt-and-suspenders for dropped wakeups */
-void drain_cb(ev_timer*, int)
+void UartRingHsmDemo::drain_cb(ev_timer&, int) noexcept
 {
     drain_ring();
 
-    if (!g_running.load() && (0U == g_ring.data_len()))
+    if (!running_.load() && (0U == ring_.data_len()))
     {
-        g_loop->break_loop();
+        loop_.break_loop();
     }
 }
 
-void frame_cb(const uart::Frame& frame, void*)
+int UartRingHsmDemo::run() noexcept
 {
-    std::printf("[HSM] frame: class=0x%02X cmd=0x%02X data_len=%u\n",
-                static_cast<unsigned>(frame.cmd_class),
-                static_cast<unsigned>(frame.cmd),
-                static_cast<unsigned>(frame.data_len));
-    ++g_frames_rx;
+    parser_.init(frame_cb, this);
+
+    wake_.start();
+    drain_.start(0.005, 0.005);
+
+    pthread_t isr;
+    static_cast<void>(pthread_create(&isr, nullptr, isr_main, this));
+
+    std::printf("=== libev C++17 uart-ring-hsm demo ===\n");
+    std::printf("[test] ISR -> ring(%uB) -> ev_async -> HSM\n", kRingSize);
+
+    loop_.run(0);
+
+    static_cast<void>(pthread_join(isr, nullptr));
+
+    const uart::Stats& stats = parser_.stats();
+
+    std::printf("\n--- results ---\n");
+    std::printf("frames parsed       : %u\n", static_cast<unsigned>(stats.frames_received));
+    std::printf("bytes received      : %u\n", static_cast<unsigned>(stats.bytes_received));
+    std::printf("ring overflow bytes : %u\n", static_cast<unsigned>(dropped_));
+
+    const bool pass = (2U == frames_rx_) && (0U == dropped_);
+    std::printf("RING_HSM_CHECK: %s\n", pass ? "PASS" : "FAIL");
+
+    return pass ? 0 : 1;
 }
 
 }  // namespace
 
 int main()
 {
-    evx::Loop loop;
-    if (!loop.valid())
-    {
-        std::printf("ev_loop_new failed\n");
-        return 1;
-    }
-    g_loop = &loop;
-
-    g_parser.init(frame_cb, nullptr);
-
-    evx::Async<wake_cb> wake(loop);
-    g_wake = &wake;
-    wake.start();
-
-    evx::Timer<drain_cb> drain(loop);
-    drain.start(0.005, 0.005);
-
-    pthread_t isr;
-    static_cast<void>(pthread_create(&isr, nullptr, isr_main, nullptr));
-
-    std::printf("=== libev C++17 uart-ring-hsm demo ===\n");
-    std::printf("[test] ISR -> ring(%uB) -> ev_async -> HSM\n", kRingSize);
-
-    loop.run(0);
-
-    static_cast<void>(pthread_join(isr, nullptr));
-
-    const uart::Stats& stats = g_parser.stats();
-
-    std::printf("\n--- results ---\n");
-    std::printf("frames parsed       : %u\n", static_cast<unsigned>(stats.frames_received));
-    std::printf("bytes received      : %u\n", static_cast<unsigned>(stats.bytes_received));
-    std::printf("ring overflow bytes : %u\n", static_cast<unsigned>(g_dropped));
-
-    const bool pass = (2U == g_frames_rx) && (0U == g_dropped);
-    std::printf("RING_HSM_CHECK: %s\n", pass ? "PASS" : "FAIL");
-
-    return pass ? 0 : 1;
+    UartRingHsmDemo demo;
+    return demo.run();
 }

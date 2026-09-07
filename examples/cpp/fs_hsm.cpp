@@ -52,40 +52,6 @@ struct FileWriter {
     bool quit = false;
 };
 
-void on_done(ev_async*, int);
-
-FileWriter g_fw;
-evx::Loop* g_loop = nullptr;
-evx::Async<on_done>* g_async = nullptr;
-
-hsm::Hsm<FileWriter>* g_hsm = nullptr;
-
-/* ---- HSM actions (loop thread only) ---- */
-
-void act_start_write(FileWriter& ctx, uint16_t)
-{
-    ctx.heartbeats = 0U;
-    pthread_mutex_lock(&ctx.lock);
-    ctx.worker_phase = 0;
-    ctx.worker_busy = true;
-    pthread_cond_signal(&ctx.cond);
-    pthread_mutex_unlock(&ctx.lock);
-    std::printf("[hsm] write started (4 MiB in background)\n");
-}
-
-void act_report_done(FileWriter& ctx, uint16_t)
-{
-    std::printf("[hsm] file written+synced, %u heartbeats observed during write\n",
-                static_cast<unsigned>(ctx.heartbeats));
-}
-
-void act_report_fail(FileWriter& ctx, uint16_t)
-{
-    std::printf("[hsm] write failed (errno=%d)\n", ctx.result);
-}
-
-/* ---- HSM tables ---- */
-
 const hsm::StateDef<FileWriter> kStates[] = {
     { -1, nullptr, nullptr, "TOP" },
     { kTop, nullptr, nullptr, "IDLE" },
@@ -97,37 +63,78 @@ const hsm::StateDef<FileWriter> kStates[] = {
 };
 
 const hsm::TransitionDef<FileWriter> kTransitions[] = {
-    { kIdle, kWriteReq, kWriting, hsm::TransitionKind::External, nullptr, act_start_write },
-    { kBusy, kWorkerFail, kFailed, hsm::TransitionKind::External, nullptr, act_report_fail },
+    { kIdle, kWriteReq, kWriting, hsm::TransitionKind::External, nullptr,
+      [](FileWriter& ctx, uint16_t) {
+          ctx.heartbeats = 0U;
+          pthread_mutex_lock(&ctx.lock);
+          ctx.worker_phase = 0;
+          ctx.worker_busy = true;
+          pthread_cond_signal(&ctx.cond);
+          pthread_mutex_unlock(&ctx.lock);
+          std::printf("[hsm] write started (4 MiB in background)\n");
+      } },
+    { kBusy, kWorkerFail, kFailed, hsm::TransitionKind::External, nullptr,
+      [](FileWriter& ctx, uint16_t) { std::printf("[hsm] write failed (errno=%d)\n", ctx.result); } },
     { kWriting, kWriteDone, kSyncing, hsm::TransitionKind::External, nullptr, nullptr },
-    { kSyncing, kSyncDone, kDone, hsm::TransitionKind::External, nullptr, act_report_done },
+    { kSyncing, kSyncDone, kDone, hsm::TransitionKind::External, nullptr,
+      [](FileWriter& ctx, uint16_t) {
+          std::printf("[hsm] file written+synced, %u heartbeats observed during write\n",
+                      static_cast<unsigned>(ctx.heartbeats));
+      } },
 };
 
 constexpr uint16_t kNumStates = static_cast<uint16_t>(sizeof(kStates) / sizeof(kStates[0]));
 constexpr uint16_t kNumTransitions = static_cast<uint16_t>(sizeof(kTransitions) / sizeof(kTransitions[0]));
 
-/* ---- worker thread: blocking file I/O lives here, never in the loop ---- */
+class FsHsmDemo {
+public:
+    FsHsmDemo() noexcept
+        : hsm_(kStates, kNumStates, kTransitions, kNumTransitions, kIdle, /*max_depth=*/3U),
+          async_(loop_, this),
+          heartbeat_(loop_, this),
+          step_(loop_, this)
+    {
+    }
 
-void* worker_main(void*)
+    int run() noexcept;
+
+private:
+    void on_done(ev_async& w, int revents) noexcept;
+    void heartbeat_cb(ev_timer& w, int revents) noexcept;
+    void step_cb(ev_timer& w, int revents) noexcept;
+    static void* worker_main(void* arg) noexcept;
+
+    FileWriter fw_;
+    evx::Loop loop_;
+    hsm::Hsm<FileWriter> hsm_;
+    evx::Async<FsHsmDemo, &FsHsmDemo::on_done> async_;
+    evx::Timer<FsHsmDemo, &FsHsmDemo::heartbeat_cb> heartbeat_;
+    evx::Timer<FsHsmDemo, &FsHsmDemo::step_cb> step_;
+};
+
+void* FsHsmDemo::worker_main(void* arg) noexcept
 {
+    FsHsmDemo* self = static_cast<FsHsmDemo*>(arg);
+    FileWriter& fw = self->fw_;
+
     for (;;)
     {
         bool do_write = false;
         bool do_sync = false;
 
-        pthread_mutex_lock(&g_fw.lock);
-        while (!g_fw.worker_busy && !g_fw.quit)
+        pthread_mutex_lock(&fw.lock);
+        while (!fw.worker_busy && !fw.quit)
         {
-            pthread_cond_wait(&g_fw.cond, &g_fw.lock);
+            pthread_cond_wait(&fw.cond, &fw.lock);
         }
-        if (g_fw.quit)
+        if (fw.quit)
         {
-            pthread_mutex_unlock(&g_fw.lock);
+            pthread_mutex_unlock(&fw.lock);
             break;
         }
-        do_write = (0 == g_fw.worker_phase);
+        do_write = (0 == fw.worker_phase);
         do_sync = true;
-        pthread_mutex_unlock(&g_fw.lock);
+        pthread_mutex_unlock(&fw.lock);
 
         if (do_write)
         {
@@ -137,7 +144,7 @@ void* worker_main(void*)
 
             for (uint16_t i = 0U; i < kChunks && ok; ++i)
             {
-                const ssize_t n = write(g_fw.fd, chunk, sizeof(chunk));
+                const ssize_t n = write(fw.fd, chunk, sizeof(chunk));
                 if (n != static_cast<ssize_t>(sizeof(chunk)))
                 {
                     ok = false;
@@ -146,140 +153,124 @@ void* worker_main(void*)
                 usleep(2000);
             }
 
-            g_fw.result = ok ? 0 : -1;
+            fw.result = ok ? 0 : -1;
             do_sync = ok;
         }
 
         if (do_sync)
         {
-            g_fw.result = (0 == fsync(g_fw.fd)) ? 0 : -1;
+            fw.result = (0 == fsync(fw.fd)) ? 0 : -1;
         }
 
-        g_async->send();
+        self->async_.send();
 
-        pthread_mutex_lock(&g_fw.lock);
-        g_fw.worker_busy = false;
-        pthread_mutex_unlock(&g_fw.lock);
+        pthread_mutex_lock(&fw.lock);
+        fw.worker_busy = false;
+        pthread_mutex_unlock(&fw.lock);
     }
 
     return nullptr;
 }
 
-/* ---- ev_async callback: worker -> loop, translate to HSM events ---- */
-
-void on_done(ev_async*, int)
+void FsHsmDemo::on_done(ev_async&, int) noexcept
 {
-    if (0 != g_fw.result)
+    if (0 != fw_.result)
     {
-        g_hsm->dispatch(g_fw, kWorkerFail);
-        g_loop->break_loop();
+        hsm_.dispatch(fw_, kWorkerFail);
+        loop_.break_loop();
         return;
     }
 
-    if (g_hsm->current_state() == kWriting)
+    if (hsm_.current_state() == kWriting)
     {
-        g_hsm->dispatch(g_fw, kWriteDone);
+        hsm_.dispatch(fw_, kWriteDone);
 
-        pthread_mutex_lock(&g_fw.lock);
-        g_fw.worker_phase = 1;
-        g_fw.worker_busy = true;
-        pthread_cond_signal(&g_fw.cond);
-        pthread_mutex_unlock(&g_fw.lock);
+        pthread_mutex_lock(&fw_.lock);
+        fw_.worker_phase = 1;
+        fw_.worker_busy = true;
+        pthread_cond_signal(&fw_.cond);
+        pthread_mutex_unlock(&fw_.lock);
     }
     else
     {
-        g_hsm->dispatch(g_fw, kSyncDone);
-        g_loop->break_loop();
+        hsm_.dispatch(fw_, kSyncDone);
+        loop_.break_loop();
     }
 }
 
-/* ---- heartbeat + test sequencer ---- */
-
-void heartbeat_cb(ev_timer*, int)
+void FsHsmDemo::heartbeat_cb(ev_timer&, int) noexcept
 {
-    if (g_hsm->current_state() == kWriting || g_hsm->current_state() == kSyncing)
+    if (hsm_.current_state() == kWriting || hsm_.current_state() == kSyncing)
     {
-        ++g_fw.heartbeats;
+        ++fw_.heartbeats;
     }
 }
 
-void step_cb(ev_timer* w, int)
+void FsHsmDemo::step_cb(ev_timer& w, int) noexcept
 {
-    ev_timer_stop(g_loop->raw(), w);
-    g_hsm->dispatch(g_fw, kWriteReq);
+    ev_timer_stop(loop_.raw(), &w);
+    hsm_.dispatch(fw_, kWriteReq);
+}
+
+int FsHsmDemo::run() noexcept
+{
+    const char path[] = "/tmp/fs-hsm-test.bin";
+    bool pass = false;
+    struct stat st;
+
+    fw_.fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fw_.fd < 0)
+    {
+        std::printf("open failed\n");
+        return 1;
+    }
+
+    hsm_.init(fw_);
+
+    pthread_t worker;
+    static_cast<void>(pthread_create(&worker, nullptr, worker_main, this));
+
+    async_.start();
+    heartbeat_.start(kHeartbeatSec, kHeartbeatSec);
+    step_.start(0.02, 0.0);
+
+    std::printf("[test] writing 4 MiB asynchronously, heartbeat every 10 ms\n");
+    loop_.run(0);
+
+    off_t size = 0;
+    if (0 == fstat(fw_.fd, &st))
+    {
+        size = st.st_size;
+    }
+
+    const char* state_name = hsm_.current_state_name();
+    const bool is_done = (nullptr != state_name) && (0 == std::strcmp(state_name, "DONE"));
+    pass = is_done &&
+           (size == static_cast<off_t>(kChunks * kChunkSize)) &&
+           (fw_.heartbeats >= 10U);
+
+    std::printf("\n--- results ---\n");
+    std::printf("final state              : %s\n", (nullptr != state_name) ? state_name : "?");
+    std::printf("file size                : %ld bytes\n", static_cast<long>(size));
+    std::printf("heartbeats during write  : %u\n", static_cast<unsigned>(fw_.heartbeats));
+    std::printf("ASYNC_CHECK: %s\n", pass ? "PASS" : "FAIL");
+
+    pthread_mutex_lock(&fw_.lock);
+    fw_.quit = true;
+    pthread_cond_signal(&fw_.cond);
+    pthread_mutex_unlock(&fw_.lock);
+    static_cast<void>(pthread_join(worker, nullptr));
+
+    close(fw_.fd);
+    unlink(path);
+
+    return pass ? 0 : 1;
 }
 
 }  // namespace
 
 int main()
 {
-    const char path[] = "/tmp/fs-hsm-test.bin";
-    bool pass = false;
-    struct stat st;
-
-    g_fw.fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if (g_fw.fd < 0)
-    {
-        std::printf("open failed\n");
-        return 1;
-    }
-
-    evx::Loop loop;
-    if (!loop.valid())
-    {
-        std::printf("ev_loop_new failed\n");
-        close(g_fw.fd);
-        return 1;
-    }
-    g_loop = &loop;
-
-    hsm::Hsm<FileWriter> hsm(kStates, kNumStates, kTransitions, kNumTransitions,
-                             kIdle, /*max_depth=*/3U);
-    g_hsm = &hsm;
-    hsm.init(g_fw);
-
-    pthread_t worker;
-    static_cast<void>(pthread_create(&worker, nullptr, worker_main, nullptr));
-
-    evx::Async<on_done> async(loop);
-    g_async = &async;
-    async.start();
-
-    evx::Timer<heartbeat_cb> heartbeat(loop);
-    heartbeat.start(kHeartbeatSec, kHeartbeatSec);
-
-    evx::Timer<step_cb> step(loop);
-    step.start(0.02, 0.0);
-
-    std::printf("[test] writing 4 MiB asynchronously, heartbeat every 10 ms\n");
-    loop.run(0);
-
-    off_t size = 0;
-    if (0 == fstat(g_fw.fd, &st))
-    {
-        size = st.st_size;
-    }
-
-    const char* state_name = hsm.current_state_name();
-    const bool is_done = (nullptr != state_name) && (0 == std::strcmp(state_name, "DONE"));
-    pass = is_done &&
-           (size == static_cast<off_t>(kChunks * kChunkSize)) &&
-           (g_fw.heartbeats >= 10U);
-
-    std::printf("\n--- results ---\n");
-    std::printf("final state              : %s\n", (nullptr != state_name) ? state_name : "?");
-    std::printf("file size                : %ld bytes\n", static_cast<long>(size));
-    std::printf("heartbeats during write  : %u\n", static_cast<unsigned>(g_fw.heartbeats));
-    std::printf("ASYNC_CHECK: %s\n", pass ? "PASS" : "FAIL");
-
-    pthread_mutex_lock(&g_fw.lock);
-    g_fw.quit = true;
-    pthread_cond_signal(&g_fw.cond);
-    pthread_mutex_unlock(&g_fw.lock);
-    static_cast<void>(pthread_join(worker, nullptr));
-
-    close(g_fw.fd);
-    unlink(path);
-
-    return pass ? 0 : 1;
+    FsHsmDemo demo;
+    return demo.run();
 }

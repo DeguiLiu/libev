@@ -7,6 +7,7 @@
 // the HSM, one signal per tick.
 // SPDX-License-Identifier: MIT
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 
@@ -42,78 +43,50 @@ constexpr int8_t kIdle = 4;
 constexpr int8_t kActive = 5;
 constexpr int8_t kDisconnecting = 6;
 
-void disconnected_entry(ProtocolContext& ctx)
-{
-    ctx.connected = false;
-    std::printf("  [Disconnected] entry: connection closed\n");
-}
-
-void connecting_entry(ProtocolContext& ctx)
-{
-    ++ctx.syn_count;
-    std::printf("  [Connecting] entry: sending SYN...\n");
-}
-
-void connected_entry(ProtocolContext& ctx)
-{
-    ctx.connected = true;
-    std::printf("  [Connected] entry: connection established\n");
-}
-
-void connected_exit(ProtocolContext&)
-{
-    std::printf("  [Connected] exit: leaving connected state\n");
-}
-
-void idle_entry(ProtocolContext&)
-{
-    std::printf("  [Idle] entry: waiting for data\n");
-}
-
-void active_entry(ProtocolContext&)
-{
-    std::printf("  [Active] entry: processing data\n");
-}
-
-void disconnecting_entry(ProtocolContext&)
-{
-    std::printf("  [Disconnecting] entry: sending FIN...\n");
-}
-
-void ack_action(ProtocolContext& ctx, uint16_t)
-{
-    ++ctx.ack_count;
-}
-
-void sent_action(ProtocolContext& ctx, uint16_t)
-{
-    ++ctx.data_sent_count;
-}
-
-void error_action(ProtocolContext& ctx, uint16_t)
-{
-    ++ctx.error_count;
-}
-
 const hsm::StateDef<ProtocolContext> kStates[] = {
     { -1, nullptr, nullptr, "Operational" },
-    { kOperational, disconnected_entry, nullptr, "Disconnected" },
-    { kOperational, connecting_entry, nullptr, "Connecting" },
-    { kOperational, connected_entry, connected_exit, "Connected" },
-    { kConnected, idle_entry, nullptr, "Idle" },
-    { kConnected, active_entry, nullptr, "Active" },
-    { kOperational, disconnecting_entry, nullptr, "Disconnecting" },
+    { kOperational,
+      [](ProtocolContext& ctx) {
+          ctx.connected = false;
+          std::printf("  [Disconnected] entry: connection closed\n");
+      },
+      nullptr, "Disconnected" },
+    { kOperational,
+      [](ProtocolContext& ctx) {
+          ++ctx.syn_count;
+          std::printf("  [Connecting] entry: sending SYN...\n");
+      },
+      nullptr, "Connecting" },
+    { kOperational,
+      [](ProtocolContext& ctx) {
+          ctx.connected = true;
+          std::printf("  [Connected] entry: connection established\n");
+      },
+      [](ProtocolContext&) { std::printf("  [Connected] exit: leaving connected state\n"); },
+      "Connected" },
+    { kConnected,
+      [](ProtocolContext&) { std::printf("  [Idle] entry: waiting for data\n"); },
+      nullptr, "Idle" },
+    { kConnected,
+      [](ProtocolContext&) { std::printf("  [Active] entry: processing data\n"); },
+      nullptr, "Active" },
+    { kOperational,
+      [](ProtocolContext&) { std::printf("  [Disconnecting] entry: sending FIN...\n"); },
+      nullptr, "Disconnecting" },
 };
 
 const hsm::TransitionDef<ProtocolContext> kTransitions[] = {
     { kDisconnected, kConnect, kConnecting, hsm::TransitionKind::External, nullptr, nullptr },
-    { kConnecting, kSynAck, kIdle, hsm::TransitionKind::External, nullptr, ack_action },
+    { kConnecting, kSynAck, kIdle, hsm::TransitionKind::External, nullptr,
+      [](ProtocolContext& ctx, uint16_t) { ++ctx.ack_count; } },
     { kConnecting, kTimeout, kDisconnected, hsm::TransitionKind::External, nullptr, nullptr },
     /* Connected handles DISCONNECT for the Idle/Active children. */
     { kConnected, kDisconnect, kDisconnecting, hsm::TransitionKind::External, nullptr, nullptr },
     { kIdle, kDataReady, kActive, hsm::TransitionKind::External, nullptr, nullptr },
-    { kActive, kDataSent, kIdle, hsm::TransitionKind::External, nullptr, sent_action },
-    { kActive, kError, kIdle, hsm::TransitionKind::External, nullptr, error_action },
+    { kActive, kDataSent, kIdle, hsm::TransitionKind::External, nullptr,
+      [](ProtocolContext& ctx, uint16_t) { ++ctx.data_sent_count; } },
+    { kActive, kError, kIdle, hsm::TransitionKind::External, nullptr,
+      [](ProtocolContext& ctx, uint16_t) { ++ctx.error_count; } },
     { kDisconnecting, kFinAck, kDisconnected, hsm::TransitionKind::External, nullptr, nullptr },
     { kDisconnecting, kTimeout, kDisconnected, hsm::TransitionKind::External, nullptr, nullptr },
 };
@@ -121,18 +94,29 @@ const hsm::TransitionDef<ProtocolContext> kTransitions[] = {
 constexpr uint16_t kNumStates = static_cast<uint16_t>(sizeof(kStates) / sizeof(kStates[0]));
 constexpr uint16_t kNumTransitions = static_cast<uint16_t>(sizeof(kTransitions) / sizeof(kTransitions[0]));
 
-struct Driver {
-    const uint16_t* script;
-    uint16_t len;
-    uint16_t idx;
-    hsm::Hsm<ProtocolContext>* hsm;
-    ProtocolContext* ctx;
-    evx::Loop* loop;
+class ProtocolDemo {
+public:
+    ProtocolDemo() noexcept
+        : hsm_(kStates, kNumStates, kTransitions, kNumTransitions, kDisconnected, /*max_depth=*/3U),
+          timer_(loop_, this)
+    {
+    }
+
+    int run() noexcept;
+
+private:
+    static const char* signal_name(uint16_t s) noexcept;
+    void on_tick(ev_timer& w, int revents) noexcept;
+
+    ProtocolContext ctx_;
+    evx::Loop loop_;
+    hsm::Hsm<ProtocolContext> hsm_;
+    evx::Timer<ProtocolDemo, &ProtocolDemo::on_tick> timer_;
+    std::array<uint16_t, 14U> script_;
+    uint16_t idx_ = 0U;
 };
 
-Driver g_drv{nullptr, 0U, 0U, nullptr, nullptr, nullptr};
-
-const char* signal_name(uint16_t s)
+const char* ProtocolDemo::signal_name(uint16_t s) noexcept
 {
     switch (s)
     {
@@ -148,24 +132,22 @@ const char* signal_name(uint16_t s)
     }
 }
 
-void on_tick(ev_timer*, int)
+void ProtocolDemo::on_tick(ev_timer&, int) noexcept
 {
-    if (g_drv.idx >= g_drv.len)
+    if (idx_ >= script_.size())
     {
-        g_drv.loop->break_loop();
+        loop_.break_loop();
         return;
     }
-    const uint16_t sig = g_drv.script[g_drv.idx];
-    ++g_drv.idx;
+    const uint16_t sig = script_[idx_];
+    ++idx_;
     std::printf(">> %s\n", signal_name(sig));
-    g_drv.hsm->dispatch(*g_drv.ctx, sig);
+    hsm_.dispatch(ctx_, sig);
 }
 
-}  // namespace
-
-int main()
+int ProtocolDemo::run() noexcept
 {
-    const uint16_t script[] = {
+    script_ = {
         kConnect, kSynAck,
         kDataReady, kDataSent,
         kDataReady, kDataSent,
@@ -175,47 +157,37 @@ int main()
         kDisconnect, kFinAck,
     };
 
-    ProtocolContext ctx;
-    hsm::Hsm<ProtocolContext> hsm(kStates, kNumStates, kTransitions, kNumTransitions,
-                                  kDisconnected, /*max_depth=*/3U);
-    hsm.init(ctx);
-
-    evx::Loop loop;
-    if (!loop.valid())
-    {
-        std::printf("ev_loop_new failed\n");
-        return 1;
-    }
-
-    g_drv.script = script;
-    g_drv.len = static_cast<uint16_t>(sizeof(script) / sizeof(script[0]));
-    g_drv.idx = 0U;
-    g_drv.hsm = &hsm;
-    g_drv.ctx = &ctx;
-    g_drv.loop = &loop;
+    hsm_.init(ctx_);
 
     std::printf("=== libev C++17 protocol HSM demo ===\n");
-    evx::Timer<on_tick> timer(loop);
-    timer.start(0.0, 0.001);
+    timer_.start(0.0, 0.001);
 
-    loop.run(0);
+    loop_.run(0);
 
     const bool pass =
-        (ctx.syn_count == 1U) &&
-        (ctx.ack_count == 1U) &&
-        (ctx.data_sent_count == 4U) &&
-        (ctx.error_count == 1U) &&
-        (!ctx.connected) &&
-        (hsm.current_state() == kDisconnected);
+        (ctx_.syn_count == 1U) &&
+        (ctx_.ack_count == 1U) &&
+        (ctx_.data_sent_count == 4U) &&
+        (ctx_.error_count == 1U) &&
+        (!ctx_.connected) &&
+        (hsm_.current_state() == kDisconnected);
 
     std::printf("\n=== final context ===\n");
-    std::printf("syn_count:       %u\n", static_cast<unsigned>(ctx.syn_count));
-    std::printf("ack_count:       %u\n", static_cast<unsigned>(ctx.ack_count));
-    std::printf("data_sent_count: %u\n", static_cast<unsigned>(ctx.data_sent_count));
-    std::printf("error_count:     %u\n", static_cast<unsigned>(ctx.error_count));
-    std::printf("connected:       %s\n", ctx.connected ? "true" : "false");
-    std::printf("hsm state:       %s\n", hsm.current_state_name());
+    std::printf("syn_count:       %u\n", static_cast<unsigned>(ctx_.syn_count));
+    std::printf("ack_count:       %u\n", static_cast<unsigned>(ctx_.ack_count));
+    std::printf("data_sent_count: %u\n", static_cast<unsigned>(ctx_.data_sent_count));
+    std::printf("error_count:     %u\n", static_cast<unsigned>(ctx_.error_count));
+    std::printf("connected:       %s\n", ctx_.connected ? "true" : "false");
+    std::printf("hsm state:       %s\n", hsm_.current_state_name());
     std::printf("RESULT: %s\n", pass ? "PASS" : "FAIL");
 
     return pass ? 0 : 1;
+}
+
+}  // namespace
+
+int main()
+{
+    ProtocolDemo demo;
+    return demo.run();
 }

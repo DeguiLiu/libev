@@ -1,7 +1,9 @@
 // Minimal C++17 RAII wrappers over the libev C API. No exceptions: Loop
-// reports failure via valid(); watchers hold a Loop& and are non-copyable.
-// Callbacks are compile-time function pointers (static polymorphism, zero
-// vtable), matching the free-function HSM entry/exit/action style.
+// reports failure via valid(). Watchers bind a member-function callback via a
+// compile-time pointer-to-member template (static polymorphism, zero vtable,
+// zero heap) and hold a Loop& + the bound object. Mirrors ev++.h's
+// method_thunk but keeps the watcher non-copyable and the callback typed as
+// a reference (void (K::*)(ev_io&, int)).
 // SPDX-License-Identifier: MIT
 #pragma once
 
@@ -45,10 +47,14 @@ private:
     struct ev_loop* raw_;
 };
 
-template <void (*Callback)(ev_io*, int)>
+template <typename K, void (K::*Method)(ev_io&, int)>
 class Io {
 public:
-    explicit Io(Loop& loop) noexcept : loop_(loop) { ev_init(&w_, thunk); }
+    Io(Loop& loop, K* obj) noexcept : loop_(loop), obj_(obj)
+    {
+        ev_init(&w_, thunk);
+        w_.data = this;
+    }
 
     ~Io() noexcept { stop(); }
 
@@ -66,17 +72,23 @@ private:
     static void thunk(struct ev_loop* loop, ev_io* w, int revents) noexcept
     {
         (void)loop;
-        Callback(w, revents);
+        Io* self = static_cast<Io*>(w->data);
+        (self->obj_->*Method)(*w, revents);
     }
 
     ev_io w_;
     Loop& loop_;
+    K* obj_;
 };
 
-template <void (*Callback)(ev_timer*, int)>
+template <typename K, void (K::*Method)(ev_timer&, int)>
 class Timer {
 public:
-    explicit Timer(Loop& loop) noexcept : loop_(loop) { ev_init(&w_, thunk); }
+    Timer(Loop& loop, K* obj) noexcept : loop_(loop), obj_(obj)
+    {
+        ev_init(&w_, thunk);
+        w_.data = this;
+    }
 
     ~Timer() noexcept { stop(); }
 
@@ -104,17 +116,23 @@ private:
     static void thunk(struct ev_loop* loop, ev_timer* w, int revents) noexcept
     {
         (void)loop;
-        Callback(w, revents);
+        Timer* self = static_cast<Timer*>(w->data);
+        (self->obj_->*Method)(*w, revents);
     }
 
     ev_timer w_;
     Loop& loop_;
+    K* obj_;
 };
 
-template <void (*Callback)(ev_async*, int)>
+template <typename K, void (K::*Method)(ev_async&, int)>
 class Async {
 public:
-    explicit Async(Loop& loop) noexcept : loop_(loop) { ev_init(&w_, thunk); }
+    Async(Loop& loop, K* obj) noexcept : loop_(loop), obj_(obj)
+    {
+        ev_init(&w_, thunk);
+        w_.data = this;
+    }
 
     ~Async() noexcept { stop(); }
 
@@ -130,11 +148,13 @@ private:
     static void thunk(struct ev_loop* loop, ev_async* w, int revents) noexcept
     {
         (void)loop;
-        Callback(w, revents);
+        Async* self = static_cast<Async*>(w->data);
+        (self->obj_->*Method)(*w, revents);
     }
 
     ev_async w_;
     Loop& loop_;
+    K* obj_;
 };
 
 }  // namespace evx

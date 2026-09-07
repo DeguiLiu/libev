@@ -20,77 +20,79 @@ namespace {
 constexpr uint32_t kNumWrites = 3U;
 constexpr useconds_t kIoLatencyUs = 10000U;  // simulated erase/program latency
 
-struct ProxyState {
-    uint32_t submitted = 0U;   // writes started
-    uint32_t completed = 0U;   // writes finished
+class AsyncProxy {
+public:
+    AsyncProxy() noexcept : async_(loop_, this) {}
+
+    int run() noexcept;
+
+private:
+    void on_done(ev_async& w, int revents) noexcept;
+    void submit_next() noexcept;
+    static void* worker_main(void* arg) noexcept;
+
+    evx::Loop loop_;
+    evx::Async<AsyncProxy, &AsyncProxy::on_done> async_;
+    uint32_t submitted_ = 0U;   // writes started
+    uint32_t completed_ = 0U;   // writes finished
 };
 
-void on_done(ev_async*, int);
-
-ProxyState g_state;
-evx::Loop* g_loop = nullptr;
-evx::Async<on_done>* g_async = nullptr;
-
-void submit_next();
-
-void* worker_main(void*)
+void* AsyncProxy::worker_main(void* arg) noexcept
 {
-    usleep(kIoLatencyUs);   // blocking I/O, never on the event loop thread
-    g_async->send();        // wake the loop: this write is done
+    AsyncProxy* self = static_cast<AsyncProxy*>(arg);
+
+    usleep(kIoLatencyUs);       // blocking I/O, never on the event loop thread
+    self->async_.send();        // wake the loop: this write is done
     return nullptr;
 }
 
-void on_done(ev_async*, int)
+void AsyncProxy::on_done(ev_async&, int) noexcept
 {
-    ++g_state.completed;
-    std::printf("[proxy] write %u done\n", static_cast<unsigned>(g_state.completed));
-    if (g_state.completed < kNumWrites)
+    ++completed_;
+    std::printf("[proxy] write %u done\n", static_cast<unsigned>(completed_));
+    if (completed_ < kNumWrites)
     {
         submit_next();
     }
     else
     {
-        g_loop->break_loop();
+        loop_.break_loop();
     }
 }
 
-void submit_next()
+void AsyncProxy::submit_next() noexcept
 {
-    ++g_state.submitted;
-    std::printf("[proxy] write %u started\n", static_cast<unsigned>(g_state.submitted));
+    ++submitted_;
+    std::printf("[proxy] write %u started\n", static_cast<unsigned>(submitted_));
     pthread_t tid;
-    pthread_create(&tid, nullptr, worker_main, nullptr);
-    pthread_detach(tid);
+    static_cast<void>(pthread_create(&tid, nullptr, worker_main, this));
+    static_cast<void>(pthread_detach(tid));
+}
+
+int AsyncProxy::run() noexcept
+{
+    async_.start();
+
+    std::printf("=== libev C++17 async proxy demo ===\n");
+    submit_next();
+    loop_.run(0);
+
+    const bool pass =
+        (submitted_ == kNumWrites) &&
+        (completed_ == kNumWrites);
+
+    std::printf("submitted: %u  completed: %u\n",
+                static_cast<unsigned>(submitted_),
+                static_cast<unsigned>(completed_));
+    std::printf("RESULT: %s\n", pass ? "PASS" : "FAIL");
+
+    return pass ? 0 : 1;
 }
 
 }  // namespace
 
 int main()
 {
-    evx::Loop loop;
-    if (!loop.valid())
-    {
-        std::printf("ev_loop_new failed\n");
-        return 1;
-    }
-
-    evx::Async<on_done> async(loop);
-    g_loop = &loop;
-    g_async = &async;
-    async.start();
-
-    std::printf("=== libev C++17 async proxy demo ===\n");
-    submit_next();
-    loop.run(0);
-
-    const bool pass =
-        (g_state.submitted == kNumWrites) &&
-        (g_state.completed == kNumWrites);
-
-    std::printf("submitted: %u  completed: %u\n",
-                static_cast<unsigned>(g_state.submitted),
-                static_cast<unsigned>(g_state.completed));
-    std::printf("RESULT: %s\n", pass ? "PASS" : "FAIL");
-
-    return pass ? 0 : 1;
+    AsyncProxy proxy;
+    return proxy.run();
 }

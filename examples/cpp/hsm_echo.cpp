@@ -4,10 +4,10 @@
 // replaced by hsm.hpp. State topology: TOP -> ESTABLISHED -> CONNECTED ->
 // RECEIVING / FLUSHING, plus CLOSING / FAILED siblings under ESTABLISHED.
 // Connections live in a fixed-capacity pool (zero heap). A kSettle signal
-// re-resolves RECEIVING vs FLUSHING from the send-queue state after each
-// I/O, replacing the C version's direct perform_transition calls.
+// re-resolves RECEIVING vs FLUSHING from the send-queue state after each I/O.
 // SPDX-License-Identifier: MIT
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -30,6 +30,7 @@ constexpr int kListenPort = 7701;
 constexpr uint16_t kBufSize = 1024U;
 constexpr uint16_t kQueueCap = 8192U;
 constexpr uint16_t kMaxConns = 16U;
+constexpr uint16_t kNoConn = kMaxConns;
 
 enum Signal : uint16_t {
     kAccepted = 1U,
@@ -48,7 +49,11 @@ constexpr int8_t kFlushing = 4;
 constexpr int8_t kClosing = 5;
 constexpr int8_t kFailed = 6;
 
+class HsmEchoServer;
+
 struct Conn;
+
+/* ---- HSM entry/exit/action/guard: table data, reach the loop via Conn::owner ---- */
 
 void entry_connected(Conn&);
 void entry_rw(Conn&);
@@ -70,24 +75,19 @@ const hsm::StateDef<Conn> kStates[] = {
 };
 
 const hsm::TransitionDef<Conn> kTransitions[] = {
-    /* RECEIVING: queue data, then re-resolve against the queue state */
     { kReceiving, kData, -1, hsm::TransitionKind::Internal, nullptr, act_echo },
     { kReceiving, kSettle, kFlushing, hsm::TransitionKind::External, guard_queue_nonempty, nullptr },
     { kReceiving, kSettle, -1, hsm::TransitionKind::Internal, guard_queue_empty, nullptr },
 
-    /* FLUSHING: drain on writable, then re-resolve */
     { kFlushing, kWritable, -1, hsm::TransitionKind::Internal, nullptr, act_try_drain },
     { kFlushing, kSettle, kReceiving, hsm::TransitionKind::External, guard_queue_empty, nullptr },
     { kFlushing, kSettle, -1, hsm::TransitionKind::Internal, guard_queue_nonempty, nullptr },
 
-    /* CONNECTED handles EOF only when the queue is already drained */
     { kConnected, kEof, kClosing, hsm::TransitionKind::External, guard_queue_empty, nullptr },
 
-    /* CLOSING: keep draining until empty */
     { kClosing, kWritable, -1, hsm::TransitionKind::Internal, nullptr, act_try_drain },
     { kClosing, kEof, -1, hsm::TransitionKind::Internal, nullptr, act_try_drain },
 
-    /* ESTABLISHED: the error policy for everything below it */
     { kEstablished, kError, kFailed, hsm::TransitionKind::External, nullptr, nullptr },
 };
 
@@ -95,68 +95,113 @@ constexpr uint16_t kNumStates = static_cast<uint16_t>(sizeof(kStates) / sizeof(k
 constexpr uint16_t kNumTransitions = static_cast<uint16_t>(sizeof(kTransitions) / sizeof(kTransitions[0]));
 
 struct Conn {
+    HsmEchoServer* owner = nullptr;
     hsm::Hsm<Conn> hsm;
     ev_io io;
     char queue[kQueueCap];
-    size_t q_len;
+    size_t q_len = 0U;
     char buf[kBufSize];
-    uint64_t rx;
-    uint64_t tx;
-    ssize_t last_read;
-    bool used;
+    uint64_t rx = 0U;
+    uint64_t tx = 0U;
+    ssize_t last_read = 0;
+    bool used = false;
 
     Conn() noexcept
-        : hsm(kStates, kNumStates, kTransitions, kNumTransitions, kReceiving, /*max_depth=*/4U),
-          q_len(0U),
-          rx(0U),
-          tx(0U),
-          last_read(0),
-          used(false)
+        : hsm(kStates, kNumStates, kTransitions, kNumTransitions, kReceiving, /*max_depth=*/4U)
     {
     }
 };
 
-Conn g_conns[kMaxConns];
-evx::Loop* g_loop = nullptr;
-bool g_client_pass = false;
+class HsmEchoServer {
+public:
+    HsmEchoServer() noexcept : listen_(loop_, this), timeout_(loop_, this) {}
 
-void set_nonblock(int fd)
+    int run() noexcept;
+
+    struct ev_loop* raw() noexcept { return loop_.raw(); }
+
+    static void arm(Conn& c, int events) noexcept;
+
+private:
+    static void set_nonblock(int fd) noexcept;
+    static void conn_thunk(struct ev_loop* loop, ev_io* w, int revents) noexcept;
+    static void* client_main(void* arg) noexcept;
+
+    void accept_cb(ev_io& w, int revents) noexcept;
+    void timeout_cb(ev_timer& w, int revents) noexcept;
+    void handle_conn(Conn& c, ev_io& w, int revents) noexcept;
+
+    uint16_t alloc_conn() noexcept;
+    void teardown(Conn& c) noexcept;
+
+    evx::Loop loop_;
+    std::array<Conn, kMaxConns> conns_;
+    evx::Io<HsmEchoServer, &HsmEchoServer::accept_cb> listen_;
+    evx::Timer<HsmEchoServer, &HsmEchoServer::timeout_cb> timeout_;
+    bool client_pass_ = false;
+};
+
+void HsmEchoServer::arm(Conn& c, int events) noexcept
+{
+    struct ev_loop* loop = c.owner->raw();
+    ev_io_stop(loop, &c.io);
+    ev_io_set(&c.io, c.io.fd, events);
+    ev_io_start(loop, &c.io);
+}
+
+void HsmEchoServer::set_nonblock(int fd) noexcept
 {
     const int flags = fcntl(fd, F_GETFL, 0);
     static_cast<void>(fcntl(fd, F_SETFL, flags | O_NONBLOCK));
 }
 
-void arm(Conn& c, int events)
+uint16_t HsmEchoServer::alloc_conn() noexcept
 {
-    ev_io_stop(g_loop->raw(), &c.io);
-    ev_io_set(&c.io, c.io.fd, events);
-    ev_io_start(g_loop->raw(), &c.io);
+    for (uint16_t i = 0U; i < kMaxConns; ++i)
+    {
+        if (!conns_[i].used)
+        {
+            conns_[i].used = true;
+            return i;
+        }
+    }
+    return kNoConn;
 }
+
+void HsmEchoServer::teardown(Conn& c) noexcept
+{
+    ev_io_stop(loop_.raw(), &c.io);
+    close(c.io.fd);
+    std::printf("[hsm] connection done: rx=%lu tx=%lu\n",
+                static_cast<unsigned long>(c.rx), static_cast<unsigned long>(c.tx));
+    c.used = false;
+}
+
+/* ---- HSM entry/exit/action/guard (table data, reach loop via Conn::owner) ---- */
 
 void entry_connected(Conn& ctx)
 {
-    arm(ctx, EV_READ);
+    HsmEchoServer::arm(ctx, EV_READ);
 }
 
 void entry_rw(Conn& ctx)
 {
-    arm(ctx, EV_READ | EV_WRITE);
+    HsmEchoServer::arm(ctx, EV_READ | EV_WRITE);
 }
 
 void exit_established(Conn& ctx)
 {
-    ev_io_stop(g_loop->raw(), &ctx.io);
+    ev_io_stop(ctx.owner->raw(), &ctx.io);
     close(ctx.io.fd);
 }
 
 void entry_failed(Conn& ctx)
 {
     std::printf("[hsm] FAILED state entered (errno=%d)\n", errno);
-    ev_io_stop(g_loop->raw(), &ctx.io);
+    ev_io_stop(ctx.owner->raw(), &ctx.io);
     close(ctx.io.fd);
 }
 
-/* send as much as the kernel takes; returns false on hard error */
 bool try_flush(Conn& c)
 {
     size_t off = 0U;
@@ -221,65 +266,53 @@ bool guard_queue_nonempty(const Conn& ctx, uint16_t)
     return 0U < ctx.q_len;
 }
 
-/* ---- connection pool ---- */
-
-Conn* alloc_conn()
-{
-    for (uint16_t i = 0U; i < kMaxConns; ++i)
-    {
-        if (!g_conns[i].used)
-        {
-            g_conns[i].used = true;
-            return &g_conns[i];
-        }
-    }
-    return nullptr;
-}
-
-void teardown(Conn* c)
-{
-    ev_io_stop(g_loop->raw(), &c->io);
-    close(c->io.fd);
-    std::printf("[hsm] connection done: rx=%lu tx=%lu\n",
-                static_cast<unsigned long>(c->rx), static_cast<unsigned long>(c->tx));
-    c->used = false;
-}
-
 /* ---- libev callbacks ---- */
 
-void conn_cb(struct ev_loop*, ev_io* w, int revents)
+void HsmEchoServer::conn_thunk(struct ev_loop*, ev_io* w, int revents) noexcept
 {
-    Conn* c = static_cast<Conn*>(w->data);
+    HsmEchoServer* self = static_cast<HsmEchoServer*>(w->data);
 
+    for (Conn& c : self->conns_)
+    {
+        if (&c.io == w)
+        {
+            self->handle_conn(c, *w, revents);
+            return;
+        }
+    }
+}
+
+void HsmEchoServer::handle_conn(Conn& c, ev_io& w, int revents) noexcept
+{
     if (revents & EV_ERROR)
     {
-        c->hsm.dispatch(*c, kError);
+        c.hsm.dispatch(c, kError);
         return;
     }
 
     if (revents & EV_READ)
     {
-        const ssize_t n = recv(w->fd, c->buf, kBufSize, 0);
+        const ssize_t n = recv(w.fd, c.buf, kBufSize, 0);
 
         if (n > 0)
         {
-            c->last_read = n;
-            c->hsm.dispatch(*c, kData);          /* act_echo queues it */
+            c.last_read = n;
+            c.hsm.dispatch(c, kData);
 
-            if (!try_flush(*c))
+            if (!try_flush(c))
             {
-                c->hsm.dispatch(*c, kError);
+                c.hsm.dispatch(c, kError);
                 teardown(c);
                 return;
             }
 
-            c->hsm.dispatch(*c, kSettle);        /* resolve RECEIVING vs FLUSHING */
+            c.hsm.dispatch(c, kSettle);
         }
         else if (0 == n)
         {
-            c->hsm.dispatch(*c, kEof);
+            c.hsm.dispatch(c, kEof);
 
-            if (c->hsm.current_state() == kClosing && 0U == c->q_len)
+            if (c.hsm.current_state() == kClosing && 0U == c.q_len)
             {
                 teardown(c);
                 return;
@@ -287,7 +320,7 @@ void conn_cb(struct ev_loop*, ev_io* w, int revents)
         }
         else if (EAGAIN != errno && EINTR != errno)
         {
-            c->hsm.dispatch(*c, kError);
+            c.hsm.dispatch(c, kError);
             teardown(c);
             return;
         }
@@ -295,25 +328,25 @@ void conn_cb(struct ev_loop*, ev_io* w, int revents)
 
     if (revents & EV_WRITE)
     {
-        c->hsm.dispatch(*c, kWritable);          /* act_try_drain */
+        c.hsm.dispatch(c, kWritable);
 
-        if (c->hsm.current_state() == kClosing && 0U == c->q_len)
+        if (c.hsm.current_state() == kClosing && 0U == c.q_len)
         {
             teardown(c);
             return;
         }
 
-        c->hsm.dispatch(*c, kSettle);            /* drained -> RECEIVING */
+        c.hsm.dispatch(c, kSettle);
     }
 }
 
-void accept_cb(ev_io* w, int revents)
+void HsmEchoServer::accept_cb(ev_io& w, int revents) noexcept
 {
     (void)revents;
 
     for (;;)
     {
-        const int cfd = accept(w->fd, nullptr, nullptr);
+        const int cfd = accept(w.fd, nullptr, nullptr);
 
         if (cfd < 0)
         {
@@ -328,28 +361,35 @@ void accept_cb(ev_io* w, int revents)
             static_cast<void>(setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)));
         }
 
-        Conn* c = alloc_conn();
-        if (nullptr == c)
+        const uint16_t idx = alloc_conn();
+        if (kNoConn == idx)
         {
             close(cfd);
             continue;
         }
 
-        c->io.fd = cfd;
-        c->q_len = 0U;
-        c->rx = 0U;
-        c->tx = 0U;
-        ev_io_init(&c->io, conn_cb, cfd, EV_READ);
-        c->io.data = c;
-        c->hsm.init(*c);                          /* full entry path to RECEIVING */
+        Conn& c = conns_[idx];
+        c.owner = this;
+        c.io.fd = cfd;
+        c.q_len = 0U;
+        c.rx = 0U;
+        c.tx = 0U;
+        ev_io_init(&c.io, conn_thunk, cfd, EV_READ);
+        c.io.data = this;
+        c.hsm.init(c);
 
-        std::printf("[hsm] accepted fd=%d state=%s\n", cfd, c->hsm.current_state_name());
+        std::printf("[hsm] accepted fd=%d state=%s\n", cfd, c.hsm.current_state_name());
     }
 }
 
-/* loopback client self-check */
-void* client_main(void*)
+void HsmEchoServer::timeout_cb(ev_timer&, int) noexcept
 {
+    loop_.break_loop();
+}
+
+void* HsmEchoServer::client_main(void* arg) noexcept
+{
+    HsmEchoServer* self = static_cast<HsmEchoServer*>(arg);
     const char msg[] = "hello hsm";
     char buf[64] = {0};
 
@@ -376,29 +416,14 @@ void* client_main(void*)
     static_cast<void>(send(cfd, msg, sizeof(msg) - 1U, 0));
     const ssize_t n = recv(cfd, buf, sizeof(buf) - 1U, 0);
 
-    g_client_pass = (n > 0) && (0 == std::strcmp(buf, msg));
+    self->client_pass_ = (n > 0) && (0 == std::strcmp(buf, msg));
 
     close(cfd);
     return nullptr;
 }
 
-void timeout_cb(ev_timer*, int)
+int HsmEchoServer::run() noexcept
 {
-    g_loop->break_loop();
-}
-
-}  // namespace
-
-int main()
-{
-    evx::Loop loop;
-    if (!loop.valid())
-    {
-        std::printf("ev_loop_new failed\n");
-        return 1;
-    }
-    g_loop = &loop;
-
     const int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0)
     {
@@ -430,25 +455,30 @@ int main()
     }
     set_nonblock(lfd);
 
-    evx::Io<accept_cb> listen_w(loop);
-    listen_w.start(lfd, EV_READ);
-
-    evx::Timer<timeout_cb> timeout(loop);
-    timeout.start(2.0, 0.0);
+    listen_.start(lfd, EV_READ);
+    timeout_.start(2.0, 0.0);
 
     pthread_t client;
-    static_cast<void>(pthread_create(&client, nullptr, client_main, nullptr));
+    static_cast<void>(pthread_create(&client, nullptr, client_main, this));
 
     std::printf("=== libev C++17 hsm-echo demo ===\n");
-    std::printf("hsm echo server on port %d (backend 0x%x)\n", kListenPort, loop.backend());
+    std::printf("hsm echo server on port %d (backend 0x%x)\n", kListenPort, loop_.backend());
 
-    loop.run(0);
+    loop_.run(0);
 
     static_cast<void>(pthread_join(client, nullptr));
 
-    const bool pass = g_client_pass;
+    const bool pass = client_pass_;
     std::printf("HSM_ECHO_CHECK: %s\n", pass ? "PASS" : "FAIL");
 
     close(lfd);
     return pass ? 0 : 1;
+}
+
+}  // namespace
+
+int main()
+{
+    HsmEchoServer server;
+    return server.run();
 }
