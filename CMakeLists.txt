@@ -15,6 +15,16 @@ option(BUILD_STATIC_LIBS "Build libev as a static library" ON)
 option(BUILD_TESTING "Build tests" ON)
 option(SKIP_INSTALL_HEADERS "Do not install header files" OFF)
 
+set(EV_SANITIZER "" CACHE STRING "Sanitizer to enable: address, thread, undefined, or empty")
+
+if(EV_SANITIZER)
+    if(NOT EV_SANITIZER MATCHES "^(address|thread|undefined)$")
+        message(FATAL_ERROR "EV_SANITIZER must be address, thread, undefined, or empty")
+    endif()
+    add_compile_options(-fsanitize=${EV_SANITIZER} -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${EV_SANITIZER})
+endif()
+
 check_include_file(sys/inotify.h  HAVE_SYS_INOTIFY_H)
 check_include_file(sys/epoll.h    HAVE_SYS_EPOLL_H)
 check_include_file(sys/event.h    HAVE_SYS_EVENT_H)
