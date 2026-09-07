@@ -136,7 +136,7 @@ add_library(ev_obj OBJECT src/ev.c src/event.c)
 
 set_target_properties(ev_obj PROPERTIES
     POSITION_INDEPENDENT_CODE ON
-    C_STANDARD 99
+    C_STANDARD 11
 )
 
 target_include_directories(ev_obj
