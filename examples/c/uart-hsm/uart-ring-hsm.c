@@ -17,8 +17,8 @@
  * changes.
  *
  * Build:
- *   gcc examples/uart-hsm/uart-ring-hsm.c examples/uart-hsm/hsm_parser.c \
- *       examples/uart-hsm/state_machine.c -I examples/uart-hsm \
+ *   gcc examples/c/uart-hsm/uart-ring-hsm.c examples/c/uart-hsm/hsm_parser.c \
+ *       examples/c/uart-hsm/state_machine.c -I examples/c/uart-hsm \
  *       -I include -lev -o uart-ring-hsm -lpthread
  */
 #include <stdio.h>
@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdbool.h>
 
 #include <ev.h>
 
@@ -39,14 +40,18 @@
 #define RING_SIZE     4096U    /* power of two */
 #define ISR_POKE_COUNT 4U      /* one frame in several interrupts */
 
-static hsm_parser_t g_parser;
-static spsc_queue_t *g_ring;       /* ISR (producer) -> loop (consumer) */
-static ev_async g_wake;            /* pokes the loop when bytes arrived  */
-static ev_timer g_drain;           /* periodic safety drain (optional)   */
-static volatile int32_t g_running = 1;
+typedef struct {
+    struct ev_loop *loop;
+    hsm_parser_t parser;
+    spsc_queue_t *ring;
+    ev_async wake;
+    ev_timer drain;
+    volatile bool running;
+    uint32_t frames_rx;
+    uint32_t dropped;
+} app_t;
 
-static uint32_t g_frames_rx;
-static uint32_t g_dropped;         /* ring-full overflow count           */
+_Static_assert ((RING_SIZE & (RING_SIZE - 1U)) == 0U, "RING_SIZE must be power of two");
 
 typedef struct {
     const char *name;
@@ -57,13 +62,12 @@ typedef struct {
 static void *
 isr_thread (void *arg)
 {
+    app_t *app = (app_t *)arg;
     static const isr_test_t tests[] = {
         { "sys", VDCMD_CLASS_SYS, VDCMD_SYS_GET_INFO },
         { "spi", VDCMD_CLASS_SPI, VDCMD_SPI_READ     },
     };
     uint32_t i;
-
-    (void) arg;
 
     usleep (50000); /* let the loop arm first */
 
@@ -79,110 +83,121 @@ isr_thread (void *arg)
         {
             uint32_t n = (len - off > ISR_POKE_COUNT) ? ISR_POKE_COUNT : (len - off);
 
-            if (SPSC_QUEUE_OK != spsc_queue_push (g_ring, &frame[off], n))
-                g_dropped += n;
+            if (SPSC_QUEUE_OK != spsc_queue_push (app->ring, &frame[off], n))
+                app->dropped += n;
 
             off += n;
-            ev_async_send (EV_DEFAULT, &g_wake); /* wake the loop */
-            usleep (1000);                        /* next interrupt arrives later */
+            ev_async_send (app->loop, &app->wake); /* wake the loop */
+            usleep (1000);                          /* next interrupt arrives later */
         }
     }
 
-    g_running = 0;
-    ev_async_send (EV_DEFAULT, &g_wake);
+    app->running = false;
+    ev_async_send (app->loop, &app->wake);
     return NULL;
 }
 
 /* consumer: loop side -- drain the ring straight into the HSM */
 static void
-drain_ring (void)
+drain_ring (app_t *app)
 {
     uint8_t buf[64];
     uint32_t got;
 
-    while (0 != (got = spsc_queue_pop (g_ring, buf, sizeof (buf))))
-        hsm_parser_put_data (&g_parser, buf, got);
+    while (0 != (got = spsc_queue_pop (app->ring, buf, sizeof (buf))))
+        hsm_parser_put_data (&app->parser, buf, got);
 }
 
 static void
-wake_cb (EV_P_ ev_async *a, int revents)
+wake_cb (EV_P_ ev_async *w, int revents)
 {
-    (void) a; (void) revents;
+    app_t *app = (app_t *)w->data;
 
-    drain_ring ();
+    (void) revents;
 
-    if (0 == g_running && 0U == spsc_queue_data_len (g_ring))
+    drain_ring (app);
+
+    if (false == app->running && 0U == spsc_queue_data_len (app->ring))
         ev_break (EV_A_ EVBREAK_ALL);
 }
 
 /* periodic drain: belt-and-suspenders for dropped wakeups (real UARTs
  * also have a character-timeout polling fallback) */
 static void
-drain_cb (EV_P_ ev_timer *t, int revents)
+drain_cb (EV_P_ ev_timer *w, int revents)
 {
-    (void) revents;
-    drain_ring ();
+    app_t *app = (app_t *)w->data;
 
-    if (0 == g_running && 0U == spsc_queue_data_len (g_ring))
+    (void) revents;
+
+    drain_ring (app);
+
+    if (false == app->running && 0U == spsc_queue_data_len (app->ring))
         ev_break (EV_A_ EVBREAK_ALL);
 }
 
 static void
 frame_cb (const uart_frame_t *frame, void *user_data)
 {
-    (void) user_data;
+    app_t *app = (app_t *)user_data;
+
     printf ("[HSM] frame: class=0x%02X cmd=0x%02X data_len=%u\n",
             frame->cmd_class, frame->cmd, frame->data_len);
-    g_frames_rx++;
+    app->frames_rx++;
 }
 
 int
 main (void)
 {
-    struct ev_loop *loop = EV_DEFAULT;
+    app_t app = { 0 };
     pthread_t isr;
     const hsm_parser_stats_t *stats;
     int32_t pass;
 
-    g_ring = spsc_queue_create (RING_SIZE);
+    app.loop = EV_DEFAULT;
+    app.running = true;
 
-    if (NULL == g_ring)
+    app.ring = spsc_queue_create (RING_SIZE);
+
+    if (NULL == app.ring)
     {
         fprintf (stderr, "ring create failed\n");
         return 1;
     }
 
-    if (FALSE == hsm_parser_init (&g_parser, frame_cb, NULL))
+    if (FALSE == hsm_parser_init (&app.parser, frame_cb, &app))
     {
         fprintf (stderr, "hsm_parser_init failed\n");
         return 1;
     }
 
-    ev_async_init (&g_wake, wake_cb);
-    ev_async_start (loop, &g_wake);
+    ev_async_init (&app.wake, wake_cb);
+    app.wake.data = &app;
+    ev_async_start (app.loop, &app.wake);
 
     /* trailing-drain safety net every 5ms */
-    ev_timer_init (&g_drain, drain_cb, 0.005, 0.005);
-    ev_timer_start (loop, &g_drain);
+    ev_timer_init (&app.drain, drain_cb, 0.005, 0.005);
+    app.drain.data = &app;
+    ev_timer_start (app.loop, &app.drain);
 
-    pthread_create (&isr, NULL, isr_thread, NULL);
+    pthread_create (&isr, NULL, isr_thread, &app);
 
     printf ("[test] ISR -> ring(%uB) -> ev_async -> HSM\n", RING_SIZE);
-    ev_run (loop, 0);
+    ev_run (app.loop, 0);
 
     pthread_join (isr, NULL);
 
-    stats = hsm_parser_get_stats (&g_parser);
+    stats = hsm_parser_get_stats (&app.parser);
 
     printf ("\n--- results ---\n");
     printf ("frames parsed       : %u\n", (unsigned)stats->frames_received);
     printf ("bytes received      : %u\n", (unsigned)stats->bytes_received);
-    printf ("ring overflow bytes : %u\n", (unsigned)g_dropped);
+    printf ("ring overflow bytes : %u\n", (unsigned)app.dropped);
 
-    pass = (2U == g_frames_rx) && (0U == g_dropped);
+    pass = (2U == app.frames_rx) && (0U == app.dropped);
 
     printf ("RING_HSM_CHECK: %s\n", pass ? "PASS" : "FAIL");
 
-    spsc_queue_destroy (g_ring);
+    spsc_queue_destroy (app.ring);
     return pass ? 0 : 1;
 }

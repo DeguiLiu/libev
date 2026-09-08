@@ -28,7 +28,7 @@
  * ESTABLISHED which defers the close -- the same pattern DM uses for
  * "degrade only when not exclusive".
  *
- * Build: gcc examples/hsm-echo.c -I include -lev -o hsm-echo
+ * Build: gcc examples/c/hsm-echo.c examples/c/hsm.c -I include -lev -o hsm-echo
  */
 #include <stdio.h>
 #include <string.h>
@@ -45,201 +45,11 @@
 
 #include <ev.h>
 
+#include "hsm.h"
+
 #define LISTEN_PORT 7701
 #define BUF_SIZE    1024
 #define QUEUE_CAP   8192
-#define HSM_DEPTH   8
-
-/* ================================================================== */
-/* HSM engine (ported from dm_whd_hsm_engine.c, std C types)          */
-/* ================================================================== */
-
-typedef struct hsm hsm_t;
-typedef struct hsm_state hsm_state_t;
-typedef struct hsm_event hsm_event_t;
-typedef struct hsm_transition hsm_transition_t;
-
-struct hsm_event {
-    uint32_t id;
-    void *context;
-};
-
-enum {
-    HSM_TRANSITION_EXTERNAL = 0,   /* exit source chain, enter target chain */
-    HSM_TRANSITION_INTERNAL        /* run action only, stay in state       */
-};
-
-typedef void (*hsm_action_fn)(hsm_t *sm, const hsm_event_t *event);
-typedef int32_t (*hsm_guard_fn)(hsm_t *sm, const hsm_event_t *event); /* 1 pass */
-
-struct hsm_transition {
-    uint32_t id;
-    const hsm_state_t *target;     /* NULL for internal transitions */
-    hsm_guard_fn guard;            /* NULL = always passes */
-    hsm_action_fn action;          /* NULL = none */
-    int32_t type;
-};
-
-struct hsm_state {
-    const hsm_state_t *parent;
-    hsm_action_fn entry_action;
-    hsm_action_fn exit_action;
-    const hsm_transition_t *transitions;
-    uint32_t num_transitions;
-    const char *name;
-};
-
-struct hsm {
-    const hsm_state_t *current;
-    const hsm_state_t *initial;
-    const hsm_state_t *path[HSM_DEPTH];
-    void *user_data;
-};
-
-static uint32_t hsm_depth_of (const hsm_state_t *s)
-{
-    uint32_t d = 0;
-
-    while (s)
-    {
-        d++;
-        s = s->parent;
-    }
-
-    return d;
-}
-
-static const hsm_state_t *
-hsm_lca (const hsm_state_t *a, const hsm_state_t *b)
-{
-    uint32_t da = hsm_depth_of (a);
-    uint32_t db = hsm_depth_of (b);
-
-    while (da > db) { a = a->parent; da--; }
-    while (db > da) { b = b->parent; db--; }
-
-    while (a != b) { a = a->parent; b = b->parent; }
-
-    return a;
-}
-
-static void
-hsm_perform_transition (hsm_t *sm, const hsm_state_t *target, const hsm_event_t *e)
-{
-    const hsm_state_t *src = sm->current;
-    const hsm_state_t *lca;
-
-    if (src == target)
-    {
-        /* external self-transition */
-        if (src && src->exit_action)
-            src->exit_action (sm, e);
-
-        if (target->entry_action)
-            target->entry_action (sm, e);
-
-        return;
-    }
-
-    lca = hsm_lca (src, target);
-
-    /* exit from src up to (not incl.) LCA */
-    {
-        const hsm_state_t *it = src;
-
-        while (it && it != lca)
-        {
-            if (it->exit_action)
-                it->exit_action (sm, e);
-
-            it = it->parent;
-        }
-    }
-
-    /* build entry path target..LCA (exclusive) */
-    {
-        uint32_t n = 0;
-        const hsm_state_t *it = target;
-
-        while (it && it != lca)
-        {
-            sm->path[n++] = it;
-            it = it->parent;
-        }
-
-        /* enter parent-first */
-        while (n)
-        {
-            n--;
-
-            if (sm->path[n]->entry_action)
-                sm->path[n]->entry_action (sm, e);
-        }
-    }
-
-    sm->current = target;
-}
-
-/* dispatch: bubble up until some level's transition table handles it */
-static int32_t
-hsm_dispatch (hsm_t *sm, const hsm_event_t *e)
-{
-    const hsm_state_t *s = sm->current;
-
-    while (s)
-    {
-        uint32_t i;
-
-        for (i = 0; i < s->num_transitions; i++)
-        {
-            const hsm_transition_t *t = &s->transitions[i];
-
-            if (t->id != e->id)
-                continue;
-
-            if (t->guard && 0 == t->guard (sm, e))
-                continue; /* guard failed: keep scanning same table */
-
-            if (t->action)
-                t->action (sm, e);
-
-            if (HSM_TRANSITION_INTERNAL == t->type)
-                return 1;
-
-            hsm_perform_transition (sm, t->target, e);
-            return 1;
-        }
-
-        s = s->parent; /* bubble up */
-    }
-
-    return 0;
-}
-
-static void
-hsm_init (hsm_t *sm, const hsm_state_t *initial, void *user_data)
-{
-    sm->current = NULL; /* forces full entry path on first transition */
-    sm->initial = initial;
-    sm->user_data = user_data;
-    hsm_perform_transition (sm, initial, NULL);
-}
-
-static int32_t
-hsm_is_in (const hsm_t *sm, const hsm_state_t *state)
-{
-    const hsm_state_t *it = sm->current;
-
-    while (it)
-    {
-        if (it == state)
-            return 1;
-
-        it = it->parent;
-    }
-
-    return 0;
-}
 
 /* ================================================================== */
 /* connection: HSM instance + libev watcher + echo bookkeeping        */
@@ -253,10 +63,13 @@ enum {
     EVT_ERROR        /* hard error                         */
 };
 
+typedef struct app app_t;
+
 struct conn {
     hsm_t hsm;
-    int fd;
-    ev_io io;
+    app_t *app;
+    int32_t fd;
+    ev_io io;             /* io.data = this conn */
     char queue[QUEUE_CAP];
     size_t q_len;
     char buf[BUF_SIZE];
@@ -264,8 +77,12 @@ struct conn {
     struct conn *next, **pp_self;
 };
 
-static struct ev_loop *loop;
-static struct conn *conn_head;
+struct app {
+    struct ev_loop *loop;
+    struct conn *conn_head;
+    ev_io listen_w;       /* listen_w.data = &app */
+    ev_signal sig_w;
+};
 
 /* state forwards */
 static hsm_state_t s_top, s_established, s_connected, s_receiving,
@@ -274,15 +91,19 @@ static hsm_state_t s_top, s_established, s_connected, s_receiving,
 static void
 arm (struct conn *c, int events)
 {
-    ev_io_stop (loop, &c->io);
+    struct ev_loop *lp = c->app->loop;
+
+    ev_io_stop (lp, &c->io);
     ev_io_set (&c->io, c->fd, events);
-    ev_io_start (loop, &c->io);
+    ev_io_start (lp, &c->io);
 }
 
 static void
 teardown (struct conn *c)
 {
-    ev_io_stop (loop, &c->io);
+    struct ev_loop *lp = c->app->loop;
+
+    ev_io_stop (lp, &c->io);
     close (c->fd);
 
     if (c->pp_self)
@@ -399,7 +220,7 @@ static void act_exit_established (hsm_t *sm, const hsm_event_t *e)
     struct conn *c = sm->user_data;
 
     (void) e;
-    ev_io_stop (loop, &c->io);
+    ev_io_stop (c->app->loop, &c->io);
     close (c->fd);
     printf ("[hsm] socket closed on exit\n");
 }
@@ -411,7 +232,7 @@ static void act_enter_failed (hsm_t *sm, const hsm_event_t *e)
 
     (void) e;
     printf ("[hsm] FAILED state entered (errno=%d)\n", errno);
-    ev_io_stop (loop, &c->io);
+    ev_io_stop (c->app->loop, &c->io);
     close (c->fd);
 }
 
@@ -482,7 +303,7 @@ static hsm_state_t s_failed = {
 static void
 conn_cb (EV_P_ ev_io *w, int revents)
 {
-    struct conn *c = (struct conn *)(((char *)w) - offsetof (struct conn, io));
+    struct conn *c = (struct conn *)w->data;
 
     if (revents & EV_ERROR)
     {
@@ -556,9 +377,6 @@ conn_cb (EV_P_ ev_io *w, int revents)
     }
 }
 
-static ev_io listen_w;
-static ev_signal sig_w;
-
 static void
 set_nonblock (int fd)
 {
@@ -569,6 +387,8 @@ set_nonblock (int fd)
 static void
 accept_cb (EV_P_ ev_io *w, int revents)
 {
+    app_t *app = (app_t *)w->data;
+
     (void) revents;
 
     for (;;)
@@ -602,16 +422,18 @@ accept_cb (EV_P_ ev_io *w, int revents)
                 continue;
             }
 
+            c->app = app;
             c->fd = cfd;
             ev_init (&c->io, conn_cb);
+            c->io.data = c;
 
-            c->next = conn_head;
-            c->pp_self = &conn_head;
+            c->next = app->conn_head;
+            c->pp_self = &app->conn_head;
 
-            if (conn_head)
-                conn_head->pp_self = &c->next;
+            if (app->conn_head)
+                app->conn_head->pp_self = &c->next;
 
-            conn_head = c;
+            app->conn_head = c;
 
             /* enter the machine: full entry path TOP->ESTABLISHED->CONNECTED->RECEIVING */
             hsm_init (&c->hsm, &s_receiving, c);
@@ -624,10 +446,12 @@ accept_cb (EV_P_ ev_io *w, int revents)
 static void
 sig_cb (EV_P_ ev_signal *w, int revents)
 {
-    (void) w; (void) revents;
+    app_t *app = (app_t *)w->data;
 
-    while (conn_head)
-        teardown (conn_head);
+    (void) revents;
+
+    while (app->conn_head)
+        teardown (app->conn_head);
 
     ev_break (EV_A_ EVBREAK_ALL);
 }
@@ -635,11 +459,11 @@ sig_cb (EV_P_ ev_signal *w, int revents)
 int
 main (void)
 {
-    struct ev_loop *lp = EV_DEFAULT;
+    app_t app = { 0 };
     int lfd = socket (AF_INET, SOCK_STREAM, 0);
     uint32_t one = 1;
 
-    loop = lp;
+    app.loop = EV_DEFAULT;
 
     if (lfd < 0)
     {
@@ -671,17 +495,19 @@ main (void)
 
     set_nonblock (lfd);
 
-    ev_io_init (&listen_w, accept_cb, lfd, EV_READ);
-    ev_io_start (lp, &listen_w);
+    ev_io_init (&app.listen_w, accept_cb, lfd, EV_READ);
+    app.listen_w.data = &app;
+    ev_io_start (app.loop, &app.listen_w);
 
-    ev_signal_init (&sig_w, sig_cb, SIGINT);
-    ev_signal_start (lp, &sig_w);
+    ev_signal_init (&app.sig_w, sig_cb, SIGINT);
+    app.sig_w.data = &app;
+    ev_signal_start (app.loop, &app.sig_w);
 
-    printf ("hsm echo server on port %d (backend 0x%x)\n", LISTEN_PORT, ev_backend (lp));
-    ev_run (lp, 0);
+    printf ("hsm echo server on port %d (backend 0x%x)\n", LISTEN_PORT, ev_backend (app.loop));
+    ev_run (app.loop, 0);
 
-    ev_signal_stop (lp, &sig_w);
-    ev_io_stop (lp, &listen_w);
+    ev_signal_stop (app.loop, &app.sig_w);
+    ev_io_stop (app.loop, &app.listen_w);
     close (lfd);
 
     return 0;

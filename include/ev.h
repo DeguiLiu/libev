@@ -530,7 +530,11 @@ enum {
 
 #if EV_PROTOTYPES
 
+#ifdef __cplusplus
+static_assert (EVBACKEND_ALL <= EVBACKEND_MASK, "backend flags must fit in the backend mask");
+#else
 _Static_assert (EVBACKEND_ALL <= EVBACKEND_MASK, "backend flags must fit in the backend mask");
+#endif
 
 EV_API_DECL int ev_version_major (void) EV_NOEXCEPT;
 EV_API_DECL int ev_version_minor (void) EV_NOEXCEPT;

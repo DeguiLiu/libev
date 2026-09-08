@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(libev VERSION 4.33 LANGUAGES C)
+project(libev VERSION 4.33 LANGUAGES C CXX)
 
 set(LIBEV_VERSION_CURRENT 4)
 set(LIBEV_VERSION_AGE 0)
@@ -13,6 +13,7 @@ include(CheckCSourceCompiles)
 option(BUILD_SHARED_LIBS "Build libev as a shared library" ON)
 option(BUILD_STATIC_LIBS "Build libev as a static library" ON)
 option(BUILD_TESTING "Build tests" ON)
+option(BUILD_EXAMPLES "Build C++17 examples" ON)
 option(SKIP_INSTALL_HEADERS "Do not install header files" OFF)
 
 set(EV_SANITIZER "" CACHE STRING "Sanitizer to enable: address, thread, undefined, or empty")
@@ -24,11 +25,12 @@ if(EV_WERROR)
         add_compile_options(-Wall -Wextra)
         # libev deliberately uses cross-platform idioms (macro comma-expressions,
         # nested-comment marks, EV_NOEXCEPT noreturn decls) that trip style-class
-        # warnings. Error only on warnings that indicate real defects.
+        # warnings. Error only on warnings that indicate real defects. The first
+        # three are C-only, gated so they do not leak into the C++ examples.
         add_compile_options(
-            -Werror=implicit-function-declaration
-            -Werror=int-conversion
-            -Werror=incompatible-pointer-types
+            $<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration>
+            $<$<COMPILE_LANGUAGE:C>:-Werror=int-conversion>
+            $<$<COMPILE_LANGUAGE:C>:-Werror=incompatible-pointer-types>
             -Werror=return-type
             -Werror=format
         )
@@ -198,7 +200,14 @@ endif()
 configure_file(libev.pc.in ${CMAKE_CURRENT_BINARY_DIR}/libev.pc @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libev.pc DESTINATION lib/pkgconfig)
 
-if(BUILD_TESTING)
+if(BUILD_TESTING OR BUILD_EXAMPLES)
     enable_testing()
+endif()
+
+if(BUILD_TESTING)
     add_subdirectory(test)
+endif()
+
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples/cpp)
 endif()

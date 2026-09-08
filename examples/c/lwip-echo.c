@@ -13,7 +13,7 @@
  * One client connection = one ev_io watcher on its accepted fd. Non-blocking
  * accept is used because the listening fd is registered for EV_READ only.
  *
- * Build (Linux):  gcc examples/lwip-echo.c -I include -lev -o echo
+ * Build (Linux):  gcc examples/c/lwip-echo.c -I include -lev -o echo
  * Build (RT-Thread): compile with the libev sources, see configs/rt-thread.h
  */
 #include <stdio.h>
@@ -34,16 +34,23 @@
 #define LISTEN_PORT 7700
 #define BUF_SIZE    1024
 
+/* application context: everything the callbacks need, passed via watcher->data */
+typedef struct app app_t;
+
 /* per-connection state, mirrors libuv's connection handle role */
 typedef struct conn {
   struct conn *next;
-  ev_io io;             /* watches EV_READ on the accepted fd */
+  ev_io io;             /* watches EV_READ on the accepted fd; io.data = this conn */
+  app_t *app;
   char buf[BUF_SIZE];
 } conn_t;
 
-static conn_t *conn_head;
-static ev_io listen_w;
-static ev_signal sig_w;
+struct app {
+  struct ev_loop *loop;
+  conn_t *conn_head;
+  ev_io listen_w;       /* listen_w.data = &app */
+  ev_signal sig_w;
+};
 
 static void
 set_nonblock (int fd)
@@ -53,11 +60,12 @@ set_nonblock (int fd)
 }
 
 static void
-conn_free (EV_P_ conn_t *c)
+conn_free (conn_t *c)
 {
-  conn_t **pp = &conn_head;
+  app_t *app = c->app;
+  conn_t **pp = &app->conn_head;
 
-  ev_io_stop (EV_A_ &c->io);
+  ev_io_stop (app->loop, &c->io);
   close (c->io.fd);
 
   while (*pp && *pp != c)
@@ -73,7 +81,7 @@ conn_free (EV_P_ conn_t *c)
 static void
 conn_cb (EV_P_ ev_io *w, int revents)
 {
-  conn_t *c = (conn_t *)(((char *)w) - offsetof (conn_t, io));
+  conn_t *c = (conn_t *)w->data;
 
   if (revents & EV_READ)
     {
@@ -84,7 +92,7 @@ conn_cb (EV_P_ ev_io *w, int revents)
           /* 0 = peer closed; < 0 with EAGAIN = spurious, anything else = error */
           if (0 == n || EAGAIN != errno)
             {
-              conn_free (EV_A_ c);
+              conn_free (c);
               return;
             }
         }
@@ -103,7 +111,7 @@ conn_cb (EV_P_ ev_io *w, int revents)
                   if (EAGAIN == errno)
                     continue; /* busy; retry (ok for an example, see note above) */
 
-                  conn_free (EV_A_ c);
+                  conn_free (c);
                   return;
                 }
 
@@ -117,6 +125,8 @@ conn_cb (EV_P_ ev_io *w, int revents)
 static void
 accept_cb (EV_P_ ev_io *w, int revents)
 {
+  app_t *app = (app_t *)w->data;
+
   (void) revents;
 
   for (;;)
@@ -150,11 +160,13 @@ accept_cb (EV_P_ ev_io *w, int revents)
             continue;
           }
 
-        c->next = conn_head;
-        conn_head = c;
+        c->app = app;
+        c->next = app->conn_head;
+        app->conn_head = c;
 
         ev_io_init (&c->io, conn_cb, cfd, EV_READ);
-        ev_io_start (EV_A_ &c->io);
+        c->io.data = c;
+        ev_io_start (app->loop, &c->io);
       }
     }
 }
@@ -162,10 +174,12 @@ accept_cb (EV_P_ ev_io *w, int revents)
 static void
 sig_cb (EV_P_ ev_signal *w, int revents)
 {
-  (void) w; (void) revents;
+  app_t *app = (app_t *)w->data;
 
-  while (conn_head)
-    conn_free (EV_A_ conn_head);
+  (void) revents;
+
+  while (app->conn_head)
+    conn_free (app->conn_head);
 
   ev_break (EV_A_ EVBREAK_ALL);
 }
@@ -173,9 +187,11 @@ sig_cb (EV_P_ ev_signal *w, int revents)
 int
 main (void)
 {
-  struct ev_loop *loop = EV_DEFAULT;
+  app_t app = { 0 };
   int lfd = socket (AF_INET, SOCK_STREAM, 0);
   uint32_t one = 1;
+
+  app.loop = EV_DEFAULT;
 
   if (lfd < 0)
     {
@@ -207,18 +223,20 @@ main (void)
 
   set_nonblock (lfd);
 
-  ev_io_init (&listen_w, accept_cb, lfd, EV_READ);
-  ev_io_start (loop, &listen_w);
+  ev_io_init (&app.listen_w, accept_cb, lfd, EV_READ);
+  app.listen_w.data = &app;
+  ev_io_start (app.loop, &app.listen_w);
 
   /* Ctrl-C exits cleanly (on RT-Thread replace with your own stop event) */
-  ev_signal_init (&sig_w, sig_cb, SIGINT);
-  ev_signal_start (loop, &sig_w);
+  ev_signal_init (&app.sig_w, sig_cb, SIGINT);
+  app.sig_w.data = &app;
+  ev_signal_start (app.loop, &app.sig_w);
 
-  printf ("echo server on port %d, backend 0x%x\n", LISTEN_PORT, ev_backend (loop));
-  ev_run (loop, 0);
+  printf ("echo server on port %d, backend 0x%x\n", LISTEN_PORT, ev_backend (app.loop));
+  ev_run (app.loop, 0);
 
-  ev_signal_stop (loop, &sig_w);
-  ev_io_stop (loop, &listen_w);
+  ev_signal_stop (app.loop, &app.sig_w);
+  ev_io_stop (app.loop, &app.listen_w);
   close (lfd);
 
   return 0;
