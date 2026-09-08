@@ -109,7 +109,7 @@ private:
         }
     };
 
-    void on_tick(ev_timer& w, int revents) noexcept;
+    void on_tick(ev_timer& w, uint32_t revents) noexcept;
 
     evx::Loop loop_;
     std::array<Node, kNumNodes> nodes_;
@@ -117,7 +117,7 @@ private:
     uint16_t tick_ = 0U;
 };
 
-void NodeManager::on_tick(ev_timer&, int) noexcept
+void NodeManager::on_tick(ev_timer&, uint32_t) noexcept
 {
     if (tick_ >= kNumTicks)
     {

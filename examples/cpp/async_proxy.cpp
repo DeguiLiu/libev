@@ -27,7 +27,7 @@ public:
     int run() noexcept;
 
 private:
-    void on_done(ev_async& w, int revents) noexcept;
+    void on_done(ev_async& w, uint32_t revents) noexcept;
     void submit_next() noexcept;
     static void* worker_main(void* arg) noexcept;
 
@@ -46,7 +46,7 @@ void* AsyncProxy::worker_main(void* arg) noexcept
     return nullptr;
 }
 
-void AsyncProxy::on_done(ev_async&, int) noexcept
+void AsyncProxy::on_done(ev_async&, uint32_t) noexcept
 {
     ++completed_;
     std::printf("[proxy] write %u done\n", static_cast<unsigned>(completed_));

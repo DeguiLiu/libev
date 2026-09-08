@@ -49,9 +49,9 @@ public:
 
 private:
     static void frame_cb(const uart::Frame& frame, void* user_data) noexcept;
-    void uart_rx_cb(ev_io& w, int revents) noexcept;
-    void test_timer_cb(ev_timer& w, int revents) noexcept;
-    void stop_cb(ev_timer& w, int revents) noexcept;
+    void uart_rx_cb(ev_io& w, uint32_t revents) noexcept;
+    void test_timer_cb(ev_timer& w, uint32_t revents) noexcept;
+    void stop_cb(ev_timer& w, uint32_t revents) noexcept;
     void send_frame(const TestCase& t) noexcept;
     void send_garbage() noexcept;
 
@@ -77,7 +77,7 @@ void UartHsmDemo::frame_cb(const uart::Frame& frame, void* user_data) noexcept
     ++self->frames_rx_;
 }
 
-void UartHsmDemo::uart_rx_cb(ev_io& w, int) noexcept
+void UartHsmDemo::uart_rx_cb(ev_io& w, uint32_t) noexcept
 {
     uint8_t buf[128];
 
@@ -131,7 +131,7 @@ void UartHsmDemo::send_garbage() noexcept
     static_cast<void>(write(pipe_[kWr], bad3, sizeof(bad3)));
 }
 
-void UartHsmDemo::test_timer_cb(ev_timer& w, int) noexcept
+void UartHsmDemo::test_timer_cb(ev_timer& w, uint32_t) noexcept
 {
     if (round_ < 4U)
     {
@@ -151,7 +151,7 @@ void UartHsmDemo::test_timer_cb(ev_timer& w, int) noexcept
     }
 }
 
-void UartHsmDemo::stop_cb(ev_timer&, int) noexcept
+void UartHsmDemo::stop_cb(ev_timer&, uint32_t) noexcept
 {
     loop_.break_loop();
 }

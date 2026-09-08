@@ -99,9 +99,9 @@ public:
     int run() noexcept;
 
 private:
-    void on_done(ev_async& w, int revents) noexcept;
-    void heartbeat_cb(ev_timer& w, int revents) noexcept;
-    void step_cb(ev_timer& w, int revents) noexcept;
+    void on_done(ev_async& w, uint32_t revents) noexcept;
+    void heartbeat_cb(ev_timer& w, uint32_t revents) noexcept;
+    void step_cb(ev_timer& w, uint32_t revents) noexcept;
     static void* worker_main(void* arg) noexcept;
 
     FileWriter fw_;
@@ -172,7 +172,7 @@ void* FsHsmDemo::worker_main(void* arg) noexcept
     return nullptr;
 }
 
-void FsHsmDemo::on_done(ev_async&, int) noexcept
+void FsHsmDemo::on_done(ev_async&, uint32_t) noexcept
 {
     if (0 != fw_.result)
     {
@@ -198,7 +198,7 @@ void FsHsmDemo::on_done(ev_async&, int) noexcept
     }
 }
 
-void FsHsmDemo::heartbeat_cb(ev_timer&, int) noexcept
+void FsHsmDemo::heartbeat_cb(ev_timer&, uint32_t) noexcept
 {
     if (hsm_.current_state() == kWriting || hsm_.current_state() == kSyncing)
     {
@@ -206,7 +206,7 @@ void FsHsmDemo::heartbeat_cb(ev_timer&, int) noexcept
     }
 }
 
-void FsHsmDemo::step_cb(ev_timer& w, int) noexcept
+void FsHsmDemo::step_cb(ev_timer& w, uint32_t) noexcept
 {
     ev_timer_stop(loop_.raw(), &w);
     hsm_.dispatch(fw_, kWriteReq);

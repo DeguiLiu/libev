@@ -34,11 +34,20 @@ struct TransitionDef {
     void (*action)(Context&, uint16_t);        // may be null (no-op)
 };
 
+// Compile-time trace policy: records the structural state-machine trajectory
+// (enter/exit/transition) without touching entry/exit/action. Default no-op.
+template <typename Context>
+struct NullHsmTrace {
+    static void on_enter(const char*) noexcept {}
+    static void on_exit(const char*) noexcept {}
+    static void on_transition(uint16_t, int8_t, int8_t) noexcept {}
+};
+
 // Run-time HSM over caller-provided static tables. Stores only addresses,
 // counts, the initial state and the max depth: never copies the tables and
 // never allocates. Dispatch resolves (state, signal) from the active leaf
 // upward, bounded by max_depth parent hops.
-template <typename Context>
+template <typename Context, typename Trace = NullHsmTrace<Context>>
 class Hsm {
 public:
     Hsm(const StateDef<Context>* states, uint16_t num_states,
@@ -194,6 +203,7 @@ private:
     void execute_transition(Context& ctx, uint16_t signal, int8_t source,
                             const TransitionDef<Context>& tran) noexcept
     {
+        Trace::on_transition(signal, source, tran.target);
         switch (tran.kind)
         {
         case TransitionKind::Internal:
@@ -206,11 +216,13 @@ private:
             for (;;)
             {
                 if (nullptr != states_[state].exit) { states_[state].exit(ctx); }
+                Trace::on_exit(states_[state].name);
                 if (state == source) { break; }
                 state = parent_of(state);
             }
             if (nullptr != tran.action) { tran.action(ctx, signal); }
             if (nullptr != states_[source].entry) { states_[source].entry(ctx); }
+            Trace::on_enter(states_[source].name);
             current_ = enter_initial_descendants(ctx, source);
             break;
         }
@@ -240,6 +252,7 @@ private:
         while (state != lca)
         {
             if (nullptr != states_[state].exit) { states_[state].exit(ctx); }
+            Trace::on_exit(states_[state].name);
             state = parent_of(state);
         }
     }
@@ -252,6 +265,7 @@ private:
         {
             const int8_t state = ancestor_at_depth(target, level);
             if (nullptr != states_[state].entry) { states_[state].entry(ctx); }
+            Trace::on_enter(states_[state].name);
         }
     }
 
@@ -266,6 +280,7 @@ private:
             assert(states_[child].parent == state);
             assert(hops < max_depth_);
             if (nullptr != states_[child].entry) { states_[child].entry(ctx); }
+            Trace::on_enter(states_[child].name);
             state = child;
             ++hops;
         }

@@ -47,9 +47,9 @@ private:
     static void conn_thunk(struct ev_loop* loop, ev_io* w, int revents) noexcept;
     static void* client_main(void* arg) noexcept;
 
-    void accept_cb(ev_io& w, int revents) noexcept;
-    void timeout_cb(ev_timer& w, int revents) noexcept;
-    void handle_conn(Conn& c, ev_io& w, int revents) noexcept;
+    void accept_cb(ev_io& w, uint32_t revents) noexcept;
+    void timeout_cb(ev_timer& w, uint32_t revents) noexcept;
+    void handle_conn(Conn& c, ev_io& w, uint32_t revents) noexcept;
 
     uint16_t alloc_conn() noexcept;
     void free_conn(Conn& c) noexcept;
@@ -95,13 +95,13 @@ void EchoServer::conn_thunk(struct ev_loop*, ev_io* w, int revents) noexcept
     {
         if (&c.io == w)
         {
-            self->handle_conn(c, *w, revents);
+            self->handle_conn(c, *w, static_cast<uint32_t>(revents));
             return;
         }
     }
 }
 
-void EchoServer::handle_conn(Conn& c, ev_io& w, int revents) noexcept
+void EchoServer::handle_conn(Conn& c, ev_io& w, uint32_t revents) noexcept
 {
     if (revents & EV_READ)
     {
@@ -138,7 +138,7 @@ void EchoServer::handle_conn(Conn& c, ev_io& w, int revents) noexcept
     }
 }
 
-void EchoServer::accept_cb(ev_io& w, int revents) noexcept
+void EchoServer::accept_cb(ev_io& w, uint32_t revents) noexcept
 {
     (void)revents;
 
@@ -175,7 +175,7 @@ void EchoServer::accept_cb(ev_io& w, int revents) noexcept
     }
 }
 
-void EchoServer::timeout_cb(ev_timer&, int) noexcept
+void EchoServer::timeout_cb(ev_timer&, uint32_t) noexcept
 {
     loop_.break_loop();
 }

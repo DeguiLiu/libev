@@ -94,6 +94,35 @@ const hsm::TransitionDef<ProtocolContext> kTransitions[] = {
 constexpr uint16_t kNumStates = static_cast<uint16_t>(sizeof(kStates) / sizeof(kStates[0]));
 constexpr uint16_t kNumTransitions = static_cast<uint16_t>(sizeof(kTransitions) / sizeof(kTransitions[0]));
 
+// Compile-time policy injected into evx::Timer: logs every timer event before
+// on_tick runs, keeping the cross-cutting trace out of the business callback.
+struct TimerTrace {
+    static void on_event(ev_timer&, uint32_t revents) noexcept
+    {
+        std::printf("[trace] timer fired revents=0x%x\n", static_cast<unsigned>(revents));
+    }
+};
+
+// Compile-time policy injected into hsm::Hsm: logs the structural
+// enter/exit/transition trajectory, separate from the entry/exit business logs.
+struct HsmTrace {
+    static void on_enter(const char* name) noexcept
+    {
+        if (nullptr != name) { std::printf("  [hsm-trace] enter %s\n", name); }
+    }
+    static void on_exit(const char* name) noexcept
+    {
+        if (nullptr != name) { std::printf("  [hsm-trace] exit %s\n", name); }
+    }
+    static void on_transition(uint16_t signal, int8_t source, int8_t target) noexcept
+    {
+        std::printf("[hsm-trace] sig=%u %d->%d\n",
+                    static_cast<unsigned>(signal),
+                    static_cast<int>(source),
+                    static_cast<int>(target));
+    }
+};
+
 class ProtocolDemo {
 public:
     ProtocolDemo() noexcept
@@ -106,12 +135,12 @@ public:
 
 private:
     static const char* signal_name(uint16_t s) noexcept;
-    void on_tick(ev_timer& w, int revents) noexcept;
+    void on_tick(ev_timer& w, uint32_t revents) noexcept;
 
     ProtocolContext ctx_;
     evx::Loop loop_;
-    hsm::Hsm<ProtocolContext> hsm_;
-    evx::Timer<ProtocolDemo, &ProtocolDemo::on_tick> timer_;
+    hsm::Hsm<ProtocolContext, HsmTrace> hsm_;
+    evx::Timer<ProtocolDemo, &ProtocolDemo::on_tick, TimerTrace> timer_;
     std::array<uint16_t, 14U> script_;
     uint16_t idx_ = 0U;
 };
@@ -132,7 +161,7 @@ const char* ProtocolDemo::signal_name(uint16_t s) noexcept
     }
 }
 
-void ProtocolDemo::on_tick(ev_timer&, int) noexcept
+void ProtocolDemo::on_tick(ev_timer&, uint32_t) noexcept
 {
     if (idx_ >= script_.size())
     {

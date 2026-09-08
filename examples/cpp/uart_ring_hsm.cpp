@@ -40,8 +40,8 @@ private:
     static void frame_cb(const uart::Frame& frame, void* user_data) noexcept;
     static void* isr_main(void* arg) noexcept;
 
-    void wake_cb(ev_async& w, int revents) noexcept;
-    void drain_cb(ev_timer& w, int revents) noexcept;
+    void wake_cb(ev_async& w, uint32_t revents) noexcept;
+    void drain_cb(ev_timer& w, uint32_t revents) noexcept;
     void drain_ring() noexcept;
 
     uart::HsmParser parser_;
@@ -113,7 +113,7 @@ void UartRingHsmDemo::drain_ring() noexcept
     }
 }
 
-void UartRingHsmDemo::wake_cb(ev_async&, int) noexcept
+void UartRingHsmDemo::wake_cb(ev_async&, uint32_t) noexcept
 {
     drain_ring();
 
@@ -123,7 +123,7 @@ void UartRingHsmDemo::wake_cb(ev_async&, int) noexcept
     }
 }
 
-void UartRingHsmDemo::drain_cb(ev_timer&, int) noexcept
+void UartRingHsmDemo::drain_cb(ev_timer&, uint32_t) noexcept
 {
     drain_ring();
 
