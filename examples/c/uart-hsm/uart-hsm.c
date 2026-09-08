@@ -43,15 +43,17 @@
 #define RD 0
 #define WR 1
 
-static hsm_parser_t g_parser;
-static ev_io g_uart_w;
-static ev_timer g_test_w;
-static ev_timer g_stop_w;
-static int g_uart_pipe[2];
-
-/* counters for the self-check at the end */
-static uint32_t g_frames_rx;
-static uint32_t g_frames_sent;
+typedef struct {
+    struct ev_loop *loop;
+    hsm_parser_t parser;
+    ev_io uart_w;
+    ev_timer test_w;
+    ev_timer stop_w;
+    int32_t uart_pipe[2];
+    uint32_t frames_rx;
+    uint32_t frames_sent;
+    uint32_t round_no;
+} app_t;
 
 /* ------------------------------------------------------------------ */
 /* HSM frame callback: a complete frame made it through the machine    */
@@ -59,11 +61,11 @@ static uint32_t g_frames_sent;
 static void
 frame_cb (const uart_frame_t *frame, void *user_data)
 {
-    (void) user_data;
+    app_t *app = (app_t *)user_data;
 
     printf ("[HSM] frame: class=0x%02X cmd=0x%02X data_len=%u\n",
             frame->cmd_class, frame->cmd, frame->data_len);
-    g_frames_rx++;
+    app->frames_rx++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -72,6 +74,7 @@ frame_cb (const uart_frame_t *frame, void *user_data)
 static void
 uart_rx_cb (EV_P_ ev_io *w, int revents)
 {
+    app_t *app = (app_t *)w->data;
     uint8_t buf[128];
 
     (void) revents;
@@ -82,7 +85,7 @@ uart_rx_cb (EV_P_ ev_io *w, int revents)
 
         if (n > 0)
         {
-            hsm_parser_put_data (&g_parser, buf, (uint32_t)n);
+            hsm_parser_put_data (&app->parser, buf, (uint32_t)n);
         }
         else if (n < 0 && EAGAIN == errno)
         {
@@ -120,20 +123,20 @@ static const test_case_t g_tests[] = {
 };
 
 static void
-send_frame (const test_case_t *t)
+send_frame (app_t *app, const test_case_t *t)
 {
     uint8_t buf[64];
     uint32_t len = uart_build_simple_frame (buf, t->cmd_class, t->cmd,
                                             t->data, t->data_len);
 
     printf ("[TEST] %-14s -> %u bytes\n", t->name, len);
-    write (g_uart_pipe[WR], buf, len);
-    g_frames_sent++;
+    write (app->uart_pipe[WR], buf, len);
+    app->frames_sent++;
 }
 
 /* garbage: bad header, wrong CRC, wrong tail -- the HSM must survive */
 static void
-send_garbage (void)
+send_garbage (app_t *app)
 {
     static const uint8_t bad1[] = { 0xBB, 0xCC };
     uint8_t bad2[8] = { 0xAA, 0x02, 0x00, 0x01, 0x01, 0xFF, 0xFF, 0x55 };
@@ -144,9 +147,9 @@ send_garbage (void)
     bad3[6] = (uint8_t)((crc >> 8) & 0xFFU);
 
     printf ("[TEST] garbage frames (bad hdr / bad crc / bad tail)\n");
-    write (g_uart_pipe[WR], bad1, sizeof (bad1));
-    write (g_uart_pipe[WR], bad2, sizeof (bad2));
-    write (g_uart_pipe[WR], bad3, sizeof (bad3));
+    write (app->uart_pipe[WR], bad1, sizeof (bad1));
+    write (app->uart_pipe[WR], bad2, sizeof (bad2));
+    write (app->uart_pipe[WR], bad3, sizeof (bad3));
 }
 
 static void test_timer_cb (EV_P_ ev_timer *w, int revents);
@@ -156,28 +159,28 @@ static void stop_timer_cb (EV_P_ ev_timer *w, int revents);
 static void
 test_timer_cb (EV_P_ ev_timer *w, int revents)
 {
-    static uint32_t round_no;
+    app_t *app = (app_t *)w->data;
 
     (void) revents;
 
-    if (round_no < 4)
+    if (app->round_no < 4)
     {
-        send_frame (&g_tests[round_no]);
+        send_frame (app, &g_tests[app->round_no]);
     }
-    else if (4 == round_no)
+    else if (4 == app->round_no)
     {
-        send_garbage ();
+        send_garbage (app);
     }
 
-    round_no++;
+    app->round_no++;
 
-    if (round_no > 5)
+    if (app->round_no > 5)
     {
         ev_timer_stop (EV_A_ w);
         /* let the last round drain, then stop the loop */
-        ev_timer_stop (EV_A_ &g_stop_w);
-        ev_timer_init (&g_stop_w, stop_timer_cb, 0.3, 0.);
-        ev_timer_start (EV_A_ &g_stop_w);
+        ev_timer_stop (EV_A_ &app->stop_w);
+        ev_timer_init (&app->stop_w, stop_timer_cb, 0.3, 0.);
+        ev_timer_start (EV_A_ &app->stop_w);
     }
 }
 
@@ -191,56 +194,60 @@ stop_timer_cb (EV_P_ ev_timer *w, int revents)
 int
 main (void)
 {
-    struct ev_loop *loop = EV_DEFAULT;
+    app_t app = { 0 };
     const hsm_parser_stats_t *stats;
     int32_t pass;
 
+    app.loop = EV_DEFAULT;
+
     /* the pipe plays the role of the UART fd; O_NONBLOCK on our read end */
-    if (pipe (g_uart_pipe) < 0)
+    if (pipe (app.uart_pipe) < 0)
     {
         perror ("pipe");
         return 1;
     }
 
     {
-        int flags = fcntl (g_uart_pipe[RD], F_GETFL, 0);
-        fcntl (g_uart_pipe[RD], F_SETFL, flags | O_NONBLOCK);
+        int flags = fcntl (app.uart_pipe[RD], F_GETFL, 0);
+        fcntl (app.uart_pipe[RD], F_SETFL, flags | O_NONBLOCK);
     }
 
-    if (FALSE == hsm_parser_init (&g_parser, frame_cb, NULL))
+    if (FALSE == hsm_parser_init (&app.parser, frame_cb, &app))
     {
         fprintf (stderr, "hsm_parser_init failed\n");
         return 1;
     }
 
-    ev_io_init (&g_uart_w, uart_rx_cb, g_uart_pipe[RD], EV_READ);
-    ev_io_start (loop, &g_uart_w);
+    ev_io_init (&app.uart_w, uart_rx_cb, app.uart_pipe[RD], EV_READ);
+    app.uart_w.data = &app;
+    ev_io_start (app.loop, &app.uart_w);
 
     /* first round after 50ms, then every 100ms */
-    ev_timer_init (&g_test_w, test_timer_cb, 0.05, 0.1);
-    ev_timer_start (loop, &g_test_w);
+    ev_timer_init (&app.test_w, test_timer_cb, 0.05, 0.1);
+    app.test_w.data = &app;
+    ev_timer_start (app.loop, &app.test_w);
 
-    ev_run (loop, 0);
+    ev_run (app.loop, 0);
 
     /* self-check: 4 good frames in, 4 frames out, garbage rejected */
-    stats = hsm_parser_get_stats (&g_parser);
+    stats = hsm_parser_get_stats (&app.parser);
 
     printf ("\n--- results ---\n");
-    printf ("frames sent (good)      : %u\n", (unsigned)g_frames_sent);
+    printf ("frames sent (good)      : %u\n", (unsigned)app.frames_sent);
     printf ("frames parsed           : %u\n", (unsigned)stats->frames_received);
     printf ("bytes received          : %u\n", (unsigned)stats->bytes_received);
     printf ("sync/crc/tail errors    : %u / %u / %u\n",
             stats->sync_errors, stats->crc_errors, stats->tail_errors);
 
-    pass = (g_frames_rx == g_frames_sent) &&
+    pass = (app.frames_rx == app.frames_sent) &&
            (stats->crc_errors >= 1U) &&
            (stats->tail_errors >= 1U) &&
            (stats->sync_errors >= 1U);
 
     printf ("SELF_CHECK: %s\n", pass ? "PASS" : "FAIL");
 
-    close (g_uart_pipe[RD]);
-    close (g_uart_pipe[WR]);
+    close (app.uart_pipe[RD]);
+    close (app.uart_pipe[WR]);
 
     return pass ? 0 : 1;
 }

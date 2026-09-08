@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <sys/stat.h>
 
 #include <ev.h>
@@ -58,42 +59,45 @@ typedef struct {
     hsm_t hsm;
     ev_async done_async;         /* worker -> loop wakeup */
     pthread_t worker;
-    int32_t worker_busy;         /* 0 idle, 1 busy */
-    int32_t worker_phase;        /* 0 = write data, 1 = fsync only */
+    bool worker_busy;            /* false idle, true busy */
+    bool worker_phase;           /* false = write data, true = fsync only */
     pthread_mutex_t lock;
     pthread_cond_t cond;
-    int32_t quit;                /* worker shutdown flag */
+    bool quit;                   /* worker shutdown flag */
 
     /* observability */
     uint32_t heartbeats_during_write;
     const char *path;
 } file_writer_t;
 
-static file_writer_t g_fw;
-static struct ev_loop *g_loop;
-static ev_timer g_heartbeat;
-static ev_timer g_test_step;
+typedef struct {
+    struct ev_loop *loop;
+    file_writer_t fw;
+    ev_timer heartbeat;
+    ev_timer test_step;
+} app_t;
 
 /* state forwards */
 static hsm_state_t s_top, s_idle, s_writing, s_syncing, s_done, s_failed;
 
-static const char *state_name (void) { return g_fw.hsm.current->name; }
+static const char *state_name (const file_writer_t *fw) { return fw->hsm.current->name; }
 
 /* ---- worker thread: blocking file I/O lives here, never in the loop ---- */
 
 static void *
 worker_main (void *arg)
 {
-    file_writer_t *fw = arg;
+    app_t *app = arg;
+    file_writer_t *fw = &app->fw;
 
     for (;;)
     {
-        int32_t do_write = 0;
-        int32_t do_sync = 0;
+        bool do_write = false;
+        bool do_sync = false;
 
         pthread_mutex_lock (&fw->lock);
 
-        while (0 == fw->worker_busy && 0 == fw->quit)
+        while (false == fw->worker_busy && false == fw->quit)
             pthread_cond_wait (&fw->cond, &fw->lock);
 
         if (fw->quit)
@@ -103,15 +107,15 @@ worker_main (void *arg)
         }
 
         /* phase is set by the loop before signalling the worker */
-        do_write = (0 == fw->worker_phase);
-        do_sync = 1;
+        do_write = (false == fw->worker_phase);
+        do_sync = true;
         pthread_mutex_unlock (&fw->lock);
 
         if (do_write)
         {
             static uint8_t chunk[FW_CHUNK_SIZE];
             uint32_t i;
-            int32_t ok = 1;
+            bool ok = true;
 
             memset (chunk, 0xA5, sizeof (chunk));
 
@@ -121,7 +125,7 @@ worker_main (void *arg)
 
                 if (n != (ssize_t)sizeof (chunk))
                 {
-                    ok = 0;
+                    ok = false;
                     break;
                 }
 
@@ -141,10 +145,10 @@ worker_main (void *arg)
         }
 
         /* signal the loop; ev_async_send is thread-safe */
-        ev_async_send (g_loop, &fw->done_async);
+        ev_async_send (app->loop, &fw->done_async);
 
         pthread_mutex_lock (&fw->lock);
-        fw->worker_busy = 0;
+        fw->worker_busy = false;
         pthread_mutex_unlock (&fw->lock);
     }
 
@@ -161,11 +165,11 @@ act_start_write (hsm_t *sm, const hsm_event_t *e)
     (void) e;
     fw->heartbeats_during_write = 0;
     pthread_mutex_lock (&fw->lock);
-    fw->worker_phase = 0;         /* phase 0: write data */
-    fw->worker_busy = 1;
+    fw->worker_phase = false;      /* phase false: write data */
+    fw->worker_busy = true;
     pthread_cond_signal (&fw->cond);
     pthread_mutex_unlock (&fw->lock);
-    printf ("[hsm] %s: write started (4 MiB in background)\n", state_name ());
+    printf ("[hsm] %s: write started (4 MiB in background)\n", state_name (fw));
 }
 
 static void
@@ -175,7 +179,7 @@ act_report_done (hsm_t *sm, const hsm_event_t *e)
 
     (void) e;
     printf ("[hsm] %s: file written+synced, %u heartbeats observed during write\n",
-            state_name (), fw->heartbeats_during_write);
+            state_name (fw), fw->heartbeats_during_write);
 }
 
 static void
@@ -184,7 +188,7 @@ act_report_fail (hsm_t *sm, const hsm_event_t *e)
     file_writer_t *fw = sm->user_data;
 
     (void) e;
-    printf ("[hsm] %s: write failed (errno=%d)\n", state_name (), fw->result);
+    printf ("[hsm] %s: write failed (errno=%d)\n", state_name (fw), fw->result);
 }
 
 /* transitions: WRITING and SYNCING share the completion/fail policy
@@ -217,135 +221,146 @@ static hsm_state_t s_failed = { &s_idle, NULL, NULL, NULL, 0, "FAILED" };
 /* ---- ev_async callback: worker -> loop, translate to HSM events ---- */
 
 static void
-done_async_cb (EV_P_ ev_async *a, int revents)
+done_async_cb (EV_P_ ev_async *w, int revents)
 {
+    app_t *app = (app_t *)w->data;
+    file_writer_t *fw = &app->fw;
     hsm_event_t e;
 
-    (void) a; (void) revents;
+    (void) revents;
 
-    if (0 != g_fw.result)
+    if (0 != fw->result)
     {
         e.id = EVT_WORKER_FAIL;
-        hsm_dispatch (&g_fw.hsm, &e);
+        hsm_dispatch (&fw->hsm, &e);
         ev_break (EV_A_ EVBREAK_ALL);
         return;
     }
 
-    if (hsm_is_in (&g_fw.hsm, &s_writing))
+    if (hsm_is_in (&fw->hsm, &s_writing))
     {
         e.id = EVT_WRITE_DONE;   /* data written, ask for sync next */
-        hsm_dispatch (&g_fw.hsm, &e);
+        hsm_dispatch (&fw->hsm, &e);
 
-        /* kick the worker again, phase 1: fsync only */
-        pthread_mutex_lock (&g_fw.lock);
-        g_fw.worker_phase = 1;
-        g_fw.worker_busy = 1;
-        pthread_cond_signal (&g_fw.cond);
-        pthread_mutex_unlock (&g_fw.lock);
+        /* kick the worker again, phase true: fsync only */
+        pthread_mutex_lock (&fw->lock);
+        fw->worker_phase = true;
+        fw->worker_busy = true;
+        pthread_cond_signal (&fw->cond);
+        pthread_mutex_unlock (&fw->lock);
     }
     else
     {
         e.id = EVT_SYNC_DONE;
-        hsm_dispatch (&g_fw.hsm, &e);
+        hsm_dispatch (&fw->hsm, &e);
         ev_break (EV_A_ EVBREAK_ALL);
     }
 }
 
 /* heartbeat: proof the loop stays responsive during the background write */
 static void
-heartbeat_cb (EV_P_ ev_timer *t, int revents)
+heartbeat_cb (EV_P_ ev_timer *w, int revents)
 {
-    (void) t; (void) revents;
+    app_t *app = (app_t *)w->data;
+    file_writer_t *fw = &app->fw;
 
-    if (hsm_is_in (&g_fw.hsm, &s_writing) || hsm_is_in (&g_fw.hsm, &s_syncing))
-        g_fw.heartbeats_during_write++;
+    (void) revents;
+
+    if (hsm_is_in (&fw->hsm, &s_writing) || hsm_is_in (&fw->hsm, &s_syncing))
+        fw->heartbeats_during_write++;
 }
 
 /* test sequencer: fire the write request shortly after start */
 static void
-step_cb (EV_P_ ev_timer *t, int revents)
+step_cb (EV_P_ ev_timer *w, int revents)
 {
+    app_t *app = (app_t *)w->data;
+    file_writer_t *fw = &app->fw;
     hsm_event_t e = { EVT_WRITE_REQ, NULL };
 
     (void) revents;
-    ev_timer_stop (EV_A_ t);
-    hsm_dispatch (&g_fw.hsm, &e);
+    ev_timer_stop (EV_A_ w);
+    hsm_dispatch (&fw->hsm, &e);
 }
 
 int
 main (void)
 {
+    app_t app = { 0 };
     const char *path = "/tmp/fs-hsm-test.bin";
     int32_t pass;
     struct stat st;
 
-    g_loop = EV_DEFAULT;
+    app.loop = EV_DEFAULT;
 
-    g_fw.fd = open (path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    app.fw.fd = open (path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 
-    if (g_fw.fd < 0)
+    if (app.fw.fd < 0)
     {
         perror ("open");
         return 1;
     }
 
-    g_fw.path = path;
-    pthread_mutex_init (&g_fw.lock, NULL);
-    pthread_cond_init (&g_fw.cond, NULL);
+    app.fw.path = path;
+    pthread_mutex_init (&app.fw.lock, NULL);
+    pthread_cond_init (&app.fw.cond, NULL);
 
-    hsm_init (&g_fw.hsm, &s_idle, &g_fw);
+    hsm_init (&app.fw.hsm, &s_idle, &app.fw);
 
-    pthread_create (&g_fw.worker, NULL, worker_main, &g_fw);
+    pthread_create (&app.fw.worker, NULL, worker_main, &app);
 
-    ev_async_init (&g_fw.done_async, done_async_cb);
-    ev_async_start (g_loop, &g_fw.done_async);
+    ev_async_init (&app.fw.done_async, done_async_cb);
+    app.fw.done_async.data = &app;
+    ev_async_start (app.loop, &app.fw.done_async);
 
     /* repeating heartbeat: fires every FW_HEARTBEAT_MS while loop runs */
-    ev_timer_init (&g_heartbeat, heartbeat_cb, FW_HEARTBEAT_MS / 1000.0, FW_HEARTBEAT_MS / 1000.0);
-    ev_timer_start (g_loop, &g_heartbeat);
+    ev_timer_init (&app.heartbeat, heartbeat_cb, FW_HEARTBEAT_MS / 1000.0, FW_HEARTBEAT_MS / 1000.0);
+    app.heartbeat.data = &app;
+    ev_timer_start (app.loop, &app.heartbeat);
 
     /* kick the test after 20ms */
-    ev_timer_init (&g_test_step, step_cb, 0.02, 0.);
-    ev_timer_start (g_loop, &g_test_step);
+    ev_timer_init (&app.test_step, step_cb, 0.02, 0.);
+    app.test_step.data = &app;
+    ev_timer_start (app.loop, &app.test_step);
 
     printf ("[test] writing 4 MiB asynchronously, heartbeat every %.0f ms\n",
             FW_HEARTBEAT_MS);
-    ev_run (g_loop, 0);
+    ev_run (app.loop, 0);
 
     /* ---- self-check ---- */
     {
         off_t size = 0;
 
-        if (0 == fstat (g_fw.fd, &st))
+        if (0 == fstat (app.fw.fd, &st))
             size = st.st_size;
 
         /* async proof: heartbeat kept firing during the write.
          * The worker sleeps 2ms per 64 KiB chunk (64 chunks = ~128ms),
          * so at 10ms per heartbeat we expect well over 10 ticks. */
         printf ("\n--- results ---\n");
-        printf ("final state              : %s\n", state_name ());
+        printf ("final state              : %s\n", state_name (&app.fw));
         printf ("file size                : %ld bytes\n", (long)size);
-        printf ("heartbeats during write  : %u\n", g_fw.heartbeats_during_write);
+        printf ("heartbeats during write  : %u\n", app.fw.heartbeats_during_write);
 
-        pass = (0 == strcmp (state_name (), "DONE")) &&
+        pass = (0 == strcmp (state_name (&app.fw), "DONE")) &&
                (size == (off_t)(FW_CHUNKS * FW_CHUNK_SIZE)) &&
-               (g_fw.heartbeats_during_write >= 10U);
+               (app.fw.heartbeats_during_write >= 10U);
 
         printf ("ASYNC_CHECK: %s\n", pass ? "PASS" : "FAIL");
     }
 
     /* shutdown worker */
-    pthread_mutex_lock (&g_fw.lock);
-    g_fw.quit = 1;
-    pthread_cond_signal (&g_fw.cond);
-    pthread_mutex_unlock (&g_fw.lock);
-    pthread_join (g_fw.worker, NULL);
+    pthread_mutex_lock (&app.fw.lock);
+    app.fw.quit = true;
+    pthread_cond_signal (&app.fw.cond);
+    pthread_mutex_unlock (&app.fw.lock);
+    pthread_join (app.fw.worker, NULL);
 
-    close (g_fw.fd);
+    close (app.fw.fd);
     unlink (path);
 
-    pthread_mutex_destroy (&g_fw.lock);
-    pthread_cond_destroy (&g_fw.cond);
+    pthread_mutex_destroy (&app.fw.lock);
+    pthread_cond_destroy (&app.fw.cond);
 
     return pass ? 0 : 1;
 }
